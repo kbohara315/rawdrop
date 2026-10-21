@@ -1,8 +1,10 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
@@ -395,5 +397,68 @@ func TestSetOutputDirRefusesInvalidTargets(t *testing.T) {
 	}
 	if a.banner == "" {
 		t.Error("refusing a destination change after a committed output did not surface an explanation")
+	}
+}
+
+// TestSetOutputDirSurfacesStatErrors checks that a target whose parent is a
+// regular file is rejected with a visible explanation. os.Stat on such a path
+// fails with a not-a-directory error (not os.ErrNotExist), so the destination
+// must not be mistaken for a folder that will be created: the previously chosen
+// destination and the journal stay unchanged. Using a regular-file parent keeps
+// the case portable even when the test runs as root, unlike a permission error.
+func TestSetOutputDirSurfacesStatErrors(t *testing.T) {
+	in := t.TempDir()
+	if err := os.WriteFile(filepath.Join(in, "IMG_0001.CR2"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := t.TempDir()
+	a := New()
+	a.loadPreviousFrom(stateDir)
+	t.Cleanup(func() { closeStore(a) })
+	a.AddPaths([]string{in})
+
+	good := filepath.Join(t.TempDir(), "exports")
+	a.SetOutputDir(good)
+	a.mu.Lock()
+	if a.outputDir != good {
+		got := a.outputDir
+		a.mu.Unlock()
+		t.Fatalf("setup: outputDir = %q, want %q", got, good)
+	}
+	a.mu.Unlock()
+
+	journalPath := filepath.Join(stateDir, "jobs.json")
+	before, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatalf("journal was not written for the accepted destination: %v", err)
+	}
+
+	parent := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(parent, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bad := filepath.Join(parent, "child")
+	if _, statErr := os.Stat(bad); statErr == nil || errors.Is(statErr, os.ErrNotExist) {
+		t.Skipf("os.Stat(%s) = %v; this platform does not report a not-a-directory error", bad, statErr)
+	}
+	a.SetOutputDir(bad)
+
+	a.mu.Lock()
+	gotDir := a.outputDir
+	gotBanner := a.banner
+	a.mu.Unlock()
+	if gotDir != good {
+		t.Errorf("outputDir = %q, want the unchanged %q after a bad-parent target", gotDir, good)
+	}
+	if gotBanner == "" {
+		t.Error("rejecting a stat-error destination did not surface an explanation")
+	}
+
+	after, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatalf("read journal after refusal: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Errorf("journal changed after a refused destination:\nbefore: %s\nafter:  %s", before, after)
 	}
 }

@@ -607,6 +607,10 @@ GOTOOLCHAIN=go1.27.1 go test -run 'TestSetOutputDir' ./internal/app/
 - `TestSetOutputDirRefusesInvalidTargets` proves a regular file is refused, a
   change while running is refused, and a change after the first committed
   output is refused. Each refusal is surfaced.
+- `TestSetOutputDirSurfacesStatErrors` proves a target that stats with an error
+  other than "does not exist" (for example a path under a regular-file parent)
+  is rejected with a visible explanation, leaving the previous destination and
+  the journal unchanged.
 
 Manual check:
 
@@ -636,13 +640,28 @@ Automated coverage: `TestProgressHelpers`, `TestRunningStage`, and the
 ### Per-format verification
 
 A format is not verified until a representative real sample passes the full
-contract. Point the opt-in test at a local folder of samples (never commit
-personal or large photos):
+contract. Build a **curated** fixture directory — one or two representative
+samples per camera body/format, not a whole photo library — and point the
+opt-in test at it (never commit personal or large photos):
 
 ```sh
-RAWDROP_TEST_FORMATS_DIR="/path/to/samples" GOTOOLCHAIN=go1.27.1 \
+mkdir -p ~/rawdrop-fixtures
+cp "/path/to/library/IMG_3128.CR2" ~/rawdrop-fixtures/   # Canon EOS 80D
+# add one or two more per camera body/format, then:
+RAWDROP_TEST_FORMATS_DIR=~/rawdrop-fixtures GOTOOLCHAIN=go1.27.1 \
   go test -run TestInspectAndExportRealFormats ./internal/raw/ -v
 ```
+
+The fixture directory is copied to, never exported into: each sample is opened
+read-only and outputs go to the test's temp directory.
+
+Do **not** point `RAWDROP_TEST_FORMATS_DIR` at a full library. Every sample is
+exported at full resolution, so a directory of hundreds of photos runs past the
+default `go test` timeout before it finishes. The harness walks recursively but
+fails fast with a message once the directory exceeds `maxFormatSamples`
+(currently 20), directing you to curate the fixture set; it never starts
+processing a whole library by default. `TestCollectFormatSamplesRecursesAndBounds`
+covers this bound.
 
 For each sample, confirm from the test log:
 

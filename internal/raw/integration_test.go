@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strings"
@@ -819,26 +820,19 @@ func mustExifTool(t *testing.T) string {
 	return bin
 }
 
-// TestInspectAndExportRealFormats runs the full inspect/export contract over
-// every recognized RAW file under RAWDROP_TEST_FORMATS_DIR. It is opt-in
-// because real camera samples are large and personal; nothing is committed to
-// the repository. Point it at a folder of samples for the camera families
-// being evaluated:
-//
-//	RAWDROP_TEST_FORMATS_DIR=/path/to/samples GOTOOLCHAIN=go1.27.1 \
-//	  go test -run TestInspectAndExportRealFormats ./internal/raw/
-//
-// Each sample is opened read-only; every output goes to t.TempDir(). A format
-// is not "verified" in docs/FORMAT_SUPPORT.md until a representative sample
-// from its camera family passes here.
-func TestInspectAndExportRealFormats(t *testing.T) {
-	root := os.Getenv("RAWDROP_TEST_FORMATS_DIR")
-	if root == "" {
-		t.Skip("set RAWDROP_TEST_FORMATS_DIR to a folder of real RAW samples")
-	}
-	requireExifTool(t)
-	bin := mustExifTool(t)
+// maxFormatSamples bounds TestInspectAndExportRealFormats. The harness is meant
+// for a curated fixture directory with one or two representative samples per
+// camera body/format, not a full photo library: each sample is exported at full
+// resolution, so a directory of hundreds of photos runs far past the default
+// `go test` timeout. Exceeding the bound fails fast with an explanation instead
+// of timing out midway.
+const maxFormatSamples = 20
 
+// collectFormatSamples returns the recognized RAW files under root in sorted
+// order, walking recursively and read-only. It returns an error when the
+// directory holds more than max samples (max <= 0 disables the bound), so an
+// accidental full library is rejected before any file is processed.
+func collectFormatSamples(root string, max int) ([]string, error) {
 	var files []string
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -853,12 +847,89 @@ func TestInspectAndExportRealFormats(t *testing.T) {
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("walk %s: %v", root, err)
+		return nil, err
+	}
+	sort.Strings(files)
+	if max > 0 && len(files) > max {
+		return nil, fmt.Errorf("found %d RAW files, more than the %d this harness supports; point RAWDROP_TEST_FORMATS_DIR at a curated fixture directory with one or two representative samples per camera body/format, not a full photo library", len(files), max)
+	}
+	return files, nil
+}
+
+// TestCollectFormatSamplesRecursesAndBounds checks the fixture collector: it
+// finds recognized RAW files recursively and in sorted order, ignores other
+// files, and rejects an oversized directory before any sample is processed.
+func TestCollectFormatSamplesRecursesAndBounds(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel string) {
+		t.Helper()
+		p := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("b.CR2")
+	write("a.nef")
+	write("nested/c.arw")
+	write("notes.txt") // not a RAW: ignored
+
+	got, err := collectFormatSamples(root, 0)
+	if err != nil {
+		t.Fatalf("collectFormatSamples() error: %v", err)
+	}
+	want := []string{
+		filepath.Join(root, "a.nef"),
+		filepath.Join(root, "b.CR2"),
+		filepath.Join(root, "nested", "c.arw"),
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("collectFormatSamples() = %v, want %v", got, want)
+	}
+
+	if _, err := collectFormatSamples(root, len(got)-1); err == nil {
+		t.Fatal("collectFormatSamples() = nil error, want the bound to reject an oversized directory")
+	} else if !strings.Contains(err.Error(), "curated fixture") {
+		t.Errorf("bound error = %v, want guidance to curate the fixture directory", err)
+	}
+}
+
+// TestInspectAndExportRealFormats runs the full inspect/export contract over
+// every recognized RAW file in a curated fixture directory named by
+// RAWDROP_TEST_FORMATS_DIR. It is opt-in because real camera samples are large
+// and personal; nothing is committed to the repository.
+//
+// Build the fixture directory as a small, deliberate set: one or two
+// representative samples per camera body/format being evaluated, for example
+//
+//	mkdir -p ~/rawdrop-fixtures
+//	cp "/path/to/library/IMG_3128.CR2" ~/rawdrop-fixtures/   # Canon EOS 80D
+//	# add one or two more per body, then:
+//	RAWDROP_TEST_FORMATS_DIR=~/rawdrop-fixtures GOTOOLCHAIN=go1.27.1 \
+//	  go test -run TestInspectAndExportRealFormats ./internal/raw/ -v
+//
+// Do not point it at a whole photo library: exporting every sample at full
+// resolution runs past the default `go test` timeout, and the harness fails
+// fast once the directory exceeds maxFormatSamples. Each sample is opened
+// read-only; every output goes to t.TempDir(). A format is not "verified" in
+// docs/FORMAT_SUPPORT.md until a representative sample from its camera family
+// passes here.
+func TestInspectAndExportRealFormats(t *testing.T) {
+	root := os.Getenv("RAWDROP_TEST_FORMATS_DIR")
+	if root == "" {
+		t.Skip("set RAWDROP_TEST_FORMATS_DIR to a curated fixture directory of real RAW samples")
+	}
+	files, err := collectFormatSamples(root, maxFormatSamples)
+	if err != nil {
+		t.Fatalf("%v", err)
 	}
 	if len(files) == 0 {
 		t.Skipf("no recognized RAW files under %s", root)
 	}
-	sort.Strings(files)
+	requireExifTool(t)
+	bin := mustExifTool(t)
 
 	for _, src := range files {
 		src := src

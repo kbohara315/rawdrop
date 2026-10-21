@@ -354,7 +354,10 @@ func (a *App) startThumbnails(items []*model.Item, runID int) {
 // A change is refused, with an explanation, when the export is running or when
 // the batch has already committed an output: once any photo is written, the
 // destination is fixed for that job and a new batch is required. A destination
-// that exists and is a regular file is refused too. A missing directory is
+// that exists and is a regular file is refused too, as is any target that
+// stats with an error other than "does not exist" (a permission, not-a-
+// directory, or I/O error), so an unusable path is surfaced instead of being
+// mistaken for a folder that will be created. A genuinely missing directory is
 // allowed; the export creates it.
 func (a *App) SetOutputDir(dir string) {
 	dir = strings.TrimSpace(dir)
@@ -375,16 +378,21 @@ func (a *App) SetOutputDir(dir string) {
 	case a.job != nil && a.committedOutputLocked():
 		a.banner = "This batch already exported photos. Start a new batch to change the destination."
 	default:
-		if st, statErr := os.Stat(abs); statErr == nil && !st.IsDir() {
+		switch st, statErr := os.Stat(abs); {
+		case statErr != nil && !errors.Is(statErr, os.ErrNotExist):
+			// A permission, not-a-directory, or I/O error must be surfaced
+			// rather than mistaken for a folder that will be created later.
+			a.banner = "That destination could not be used: " + statErr.Error()
+		case statErr == nil && !st.IsDir():
 			a.banner = "That destination is a file, not a folder: " + abs
-			break
+		default:
+			a.outputDir = abs
+			if a.job != nil {
+				a.job.Settings.OutputDir = abs
+				a.saveLocked()
+			}
+			a.banner = ""
 		}
-		a.outputDir = abs
-		if a.job != nil {
-			a.job.Settings.OutputDir = abs
-			a.saveLocked()
-		}
-		a.banner = ""
 	}
 	a.mu.Unlock()
 	a.redraw()

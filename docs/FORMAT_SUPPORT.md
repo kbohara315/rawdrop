@@ -35,7 +35,7 @@ verified yet.
 
 | Extension | Family | Status | Sample make/model | Embedded candidate / dimensions | Orientation | Notes |
 | --- | --- | --- | --- | --- | --- | --- |
-| `.cr2` | Canon CR2 | verified | Canon EOS 80D | `IFD0:PreviewImage`, 6000×4000 | 1 and 8 | Documented real-sample suite; 162-photo acceptance run; landscape export byte-identical to the embedded JPEG |
+| `.cr2` | Canon CR2 | verified | Canon EOS 80D | `IFD0:PreviewImage`, 6000×4000 | 1 and 8 | Real Canon EOS 80D samples, including the repository test suite's orientation-8 portrait and an orientation-1 landscape; landscape export is byte-identical to the embedded JPEG |
 | `.cr3` | Canon CR3 | recognized | — | — | — | ISO-BMFF container; thumbnail orientation falls back to ExifTool. No real sample tested |
 | `.nef` | Nikon NEF | recognized | — | — | — | Scanner test only. No real sample tested |
 | `.nrw` | Nikon NRW | recognized | — | — | — | No real sample tested |
@@ -63,12 +63,27 @@ including uppercase and mixed-case forms such as `.ARW`, `.SRF` and `.SR2`.
 ## Promoting a format to verified
 
 Verification needs a real sample from the camera family being claimed. Samples
-are never committed to the repository; point the opt-in test at a local folder:
+are never committed to the repository. Build a **curated** fixture directory
+first — one or two representative samples per camera body/format, not a whole
+photo library — and point the opt-in test at it:
 
 ```sh
-RAWDROP_TEST_FORMATS_DIR="/path/to/samples" GOTOOLCHAIN=go1.27.1 \
-  go test -run TestInspectAndExportRealFormats ./internal/raw/
+mkdir -p ~/rawdrop-fixtures
+cp "/path/to/library/IMG_3128.CR2" ~/rawdrop-fixtures/   # Canon EOS 80D
+# add one or two more per camera body/format, then:
+RAWDROP_TEST_FORMATS_DIR=~/rawdrop-fixtures GOTOOLCHAIN=go1.27.1 \
+  go test -run TestInspectAndExportRealFormats ./internal/raw/ -v
 ```
+
+The fixture directory is copied to, never exported into: each sample is opened
+read-only and every output goes to the test's temp directory.
+
+Do **not** point `RAWDROP_TEST_FORMATS_DIR` at a full library. Every sample is
+exported at full resolution, so a directory of hundreds of photos runs past the
+default `go test` timeout before it finishes. The harness walks recursively but
+stops with a clear error once the directory exceeds `maxFormatSamples`
+(currently 20), telling you to curate the fixture set — it never starts
+processing a whole library by default.
 
 `TestInspectAndExportRealFormats` walks the folder for recognized RAW files
 and, for each one, checks:
