@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"rawdrop/internal/exiftool"
 )
 
 // Export inspects src and writes a complete, verified JPEG for it to tmpPath.
@@ -44,6 +46,10 @@ func (in *Inspection) Info() Info { return in.info }
 func (in *Inspection) Export(ctx context.Context, tmpPath string, opts Options) (Result, error) {
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
+	}
+	runner := in.runner
+	if runner == nil {
+		return Result{}, errors.New("raw: inspection has no helper runner")
 	}
 	src := in.source
 	if src == "" {
@@ -87,13 +93,15 @@ func (in *Inspection) Export(ctx context.Context, tmpPath string, opts Options) 
 	}()
 
 	// Extract candidates in preference order, keeping the first one that is a
-	// complete JPEG of the camera's usable size.
+	// complete JPEG of the camera's usable size. Extraction is the first
+	// stage, so report it before any candidate is written.
+	report(opts, StageExtracting)
 	var (
 		width, height int
 		reasons       []string
 	)
 	for _, c := range in.candidates {
-		if err := extractCandidate(ctx, src, f, c); err != nil {
+		if err := extractCandidate(ctx, runner, src, f, c); err != nil {
 			if ctx.Err() != nil {
 				// A canceled extraction must surface as context.Canceled
 				// rather than as an exhausted candidate list.
@@ -127,13 +135,18 @@ func (in *Inspection) Export(ctx context.Context, tmpPath string, opts Options) 
 		}
 		return Result{}, fmt.Errorf("%w: %s: %s", ErrNoFullJPEG, filepath.Base(src), strings.Join(reasons, "; "))
 	}
+	// The source must not have changed while it was being read: otherwise the
+	// bytes just extracted may not correspond to the inspected candidates.
+	if err := in.checkSource(); err != nil {
+		return Result{}, err
+	}
 	if err := f.Close(); err != nil {
 		f = nil
 		return Result{}, fmt.Errorf("raw: close temp file: %w", err)
 	}
 	f = nil
 
-	rotated, cleaned, warning, err := applyMetadata(ctx, tmpPath, info.Orientation, opts)
+	rotated, cleaned, warning, err := applyMetadata(ctx, runner, tmpPath, info.Orientation, opts)
 	if err != nil {
 		return Result{}, err
 	}
@@ -143,11 +156,8 @@ func (in *Inspection) Export(ctx context.Context, tmpPath string, opts Options) 
 	if rotated && swapsDims(info.Orientation) {
 		expW, expH = height, width
 	}
-	bin, err := exiftoolPath()
-	if err != nil {
-		return Result{}, err
-	}
-	if err := verifyOutput(ctx, bin, tmpPath, expW, expH, final, !opts.PreserveLocation); err != nil {
+	report(opts, StageVerifying)
+	if err := verifyOutput(ctx, runner, tmpPath, expW, expH, final, !opts.PreserveLocation); err != nil {
 		return Result{}, err
 	}
 
@@ -162,18 +172,25 @@ func (in *Inspection) Export(ctx context.Context, tmpPath string, opts Options) 
 	}, nil
 }
 
+// report calls a caller's progress hook, if any.
+func report(opts Options, stage Stage) {
+	if opts.Progress != nil {
+		opts.Progress(stage)
+	}
+}
+
 // checkSource fails when the source changed after inspection, so Export never
-// uses stale candidate offsets. When the size and modification time are
-// unchanged the offsets are still valid.
+// uses stale candidate offsets. A change in the file's identity, size or
+// modification time invalidates the offsets.
 func (in *Inspection) checkSource() error {
-	if !in.identity {
+	if in.identity == nil {
 		return nil
 	}
 	st, err := os.Stat(in.source)
 	if err != nil {
 		return fmt.Errorf("raw: re-stat source: %w", err)
 	}
-	if st.Size() != in.size || !st.ModTime().Equal(in.modTime) {
+	if !sameSource(in.identity, st) {
 		return fmt.Errorf("%w: %s", ErrSourceChanged, filepath.Base(in.source))
 	}
 	return nil
@@ -181,18 +198,14 @@ func (in *Inspection) checkSource() error {
 
 // extractCandidate streams one embedded JPEG candidate into dst, replacing
 // whatever dst held. Nothing is buffered in memory beyond the file copy.
-func extractCandidate(ctx context.Context, src string, dst *os.File, c candidate) error {
+func extractCandidate(ctx context.Context, runner exiftool.Runner, src string, dst *os.File, c candidate) error {
 	if err := dst.Truncate(0); err != nil {
 		return fmt.Errorf("reset temp file: %w", err)
 	}
 	if _, err := dst.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("rewind temp file: %w", err)
 	}
-	bin, err := exiftoolPath()
-	if err != nil {
-		return err
-	}
-	return runTool(ctx, bin, []string{"-b", "-" + c.selector(), "--", src}, dst)
+	return runner.Stream(ctx, []string{"-b", "-" + c.selector(), "--", src}, dst)
 }
 
 // applyMetadata performs the metadata stages of an export on the extracted,
@@ -200,18 +213,17 @@ func extractCandidate(ctx context.Context, src string, dst *os.File, c candidate
 // orientation normalisation. It reports whether the pixels were rotated and
 // whether location metadata was cleaned; warning explains a rotation that was
 // requested but could not be applied losslessly.
-func applyMetadata(ctx context.Context, path string, orientation int, opts Options) (rotated, cleaned bool, warning string, err error) {
-	bin, err := exiftoolPath()
-	if err != nil {
-		return false, false, "", err
-	}
+func applyMetadata(ctx context.Context, runner exiftool.Runner, path string, orientation int, opts Options) (rotated, cleaned bool, warning string, err error) {
 	if !opts.PreserveLocation {
-		if err := stripLocation(ctx, bin, path); err != nil {
+		if err := stripLocation(ctx, runner, path); err != nil {
 			return false, false, "", fmt.Errorf("raw: remove location metadata: %w", err)
 		}
 		cleaned = true
 	}
 	if needsRotation(orientation, opts.CorrectOrientation) {
+		// Report the rotation just before attempting it, so the UI never shows
+		// a rotation stage while extraction is still running.
+		report(opts, StageRotating)
 		if rotateErr := rotateLossless(ctx, path, orientation); rotateErr != nil {
 			if ctx.Err() != nil {
 				return false, cleaned, "", rotateErr
@@ -222,12 +234,12 @@ func applyMetadata(ctx context.Context, path string, orientation int, opts Optio
 		}
 	}
 	final := finalOrientation(orientation, rotated)
-	current, err := readOrientation(ctx, bin, path)
+	current, err := readOrientation(ctx, runner, path)
 	if err != nil {
 		return false, cleaned, "", err
 	}
 	if rotated || current != final {
-		if err := setOrientation(ctx, bin, path, final); err != nil {
+		if err := setOrientation(ctx, runner, path, final); err != nil {
 			return false, cleaned, "", fmt.Errorf("raw: set EXIF orientation: %w", err)
 		}
 	}
@@ -235,23 +247,23 @@ func applyMetadata(ctx context.Context, path string, orientation int, opts Optio
 }
 
 // stripLocation removes GPS and geotag metadata, keeping everything else.
-func stripLocation(ctx context.Context, bin, path string) error {
+func stripLocation(ctx context.Context, runner exiftool.Runner, path string) error {
 	args := []string{"-overwrite_original", "-gps:all=", "-xmp:geotag=", "--", path}
-	_, err := captureTool(ctx, bin, args)
+	_, err := runner.Capture(ctx, args, 0)
 	return err
 }
 
 // setOrientation writes the EXIF orientation tag.
-func setOrientation(ctx context.Context, bin, path string, orientation int) error {
+func setOrientation(ctx context.Context, runner exiftool.Runner, path string, orientation int) error {
 	args := []string{"-overwrite_original", fmt.Sprintf("-Orientation#=%d", orientation), "--", path}
-	_, err := captureTool(ctx, bin, args)
+	_, err := runner.Capture(ctx, args, 0)
 	return err
 }
 
 // readOrientation reads a JPEG's EXIF orientation. A missing or invalid tag
 // is the EXIF default, 1.
-func readOrientation(ctx context.Context, bin, path string) (int, error) {
-	orientation, _, err := readOrientationAndGPS(ctx, bin, path)
+func readOrientation(ctx context.Context, runner exiftool.Runner, path string) (int, error) {
+	orientation, _, err := readOrientationAndGPS(ctx, runner, path)
 	return orientation, err
 }
 
@@ -289,7 +301,7 @@ func rotateLossless(ctx context.Context, path string, orientation int) error {
 
 // verifyOutput re-checks the finished temp file: dimensions, JPEG structure,
 // EXIF orientation and (when required) that no location metadata remains.
-func verifyOutput(ctx context.Context, bin, path string, wantW, wantH, wantOrientation int, requireNoGPS bool) error {
+func verifyOutput(ctx context.Context, runner exiftool.Runner, path string, wantW, wantH, wantOrientation int, requireNoGPS bool) error {
 	w, h, err := validateJPEGFile(path)
 	if err != nil {
 		return fmt.Errorf("raw: verify output: %w", err)
@@ -297,7 +309,7 @@ func verifyOutput(ctx context.Context, bin, path string, wantW, wantH, wantOrien
 	if w != wantW || h != wantH {
 		return fmt.Errorf("raw: verify output: dimensions are %dx%d, expected %dx%d", w, h, wantW, wantH)
 	}
-	orientation, gps, err := readOrientationAndGPS(ctx, bin, path)
+	orientation, gps, err := readOrientationAndGPS(ctx, runner, path)
 	if err != nil {
 		return fmt.Errorf("raw: verify output: %w", err)
 	}
@@ -312,9 +324,9 @@ func verifyOutput(ctx context.Context, bin, path string, wantW, wantH, wantOrien
 
 // readOrientationAndGPS reads the EXIF orientation and reports every location
 // tag still present, using one ExifTool call.
-func readOrientationAndGPS(ctx context.Context, bin, path string) (orientation int, gpsTags []string, err error) {
+func readOrientationAndGPS(ctx context.Context, runner exiftool.Runner, path string) (orientation int, gpsTags []string, err error) {
 	selectors := append([]string{"-Orientation"}, gpsSelectors...)
-	doc, err := readExifDoc(ctx, bin, path, selectors)
+	doc, err := readExifDoc(ctx, runner, path, selectors)
 	if err != nil {
 		return 0, nil, err
 	}

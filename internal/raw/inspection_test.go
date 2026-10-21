@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 // TestInspectionInfoIsACopy proves Info hands back a value, so a caller cannot
@@ -32,12 +31,7 @@ func TestInspectionRejectsChangedSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	insp := &Inspection{
-		source:   src,
-		size:     st.Size(),
-		modTime:  st.ModTime(),
-		identity: true,
-	}
+	insp := &Inspection{source: src, identity: st}
 
 	if err := insp.checkSource(); err != nil {
 		t.Fatalf("checkSource() on the unchanged source = %v, want nil", err)
@@ -47,14 +41,13 @@ func TestInspectionRejectsChangedSource(t *testing.T) {
 	if err := os.WriteFile(src, []byte("original plus extra bytes"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(10 * time.Millisecond)
 	if err := insp.checkSource(); !errors.Is(err, ErrSourceChanged) {
 		t.Fatalf("checkSource() after a size change = %v, want ErrSourceChanged", err)
 	}
 }
 
-// TestInspectionCheckSourceWithoutIdentity proves an inspection built without a
-// recorded identity (for example an in-memory fixture) does not stat the file.
+// TestInspectionCheckSourceWithoutIdentity proves a hand-built inspection with
+// no recorded identity does not stat the file.
 func TestInspectionCheckSourceWithoutIdentity(t *testing.T) {
 	insp := &Inspection{source: filepath.Join(t.TempDir(), "missing.CR2")}
 	if err := insp.checkSource(); err != nil {

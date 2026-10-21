@@ -630,12 +630,15 @@ Manual check:
       photo and its stage, and the exported count.
 - [ ] The percentage advances as photos finish; it never shows a per-file
       percentage that the tools cannot report.
+- [ ] A rotation stage appears only after extraction and only for a photo that
+      actually needs one; an upright photo never shows `Rotating…`.
 - [ ] With no active photo the line reads `Preparing…`, `Paused`, or
       `Canceling…`.
 - [ ] The old startup text never remains once work has begun.
 
-Automated coverage: `TestProgressHelpers`, `TestRunningStage`, and the
-`TestEndToEndDropExportResume` assertions on the real view.
+Automated coverage: `TestProgressHelpers`, `TestRunningStage`, the
+`TestEndToEndDropExportResume` assertions on the real view, plus the raw and
+exporter stage-order tests described below.
 
 ### Shared helper runner, one inspection, and the export pool
 
@@ -643,7 +646,7 @@ The helper runner, the inspect-once transaction, and the export pool each have
 targeted tests that do not need a window:
 
 ```sh
-GOTOOLCHAIN=go1.27.1 go test ./internal/exiftool/ ./internal/exporter/ ./internal/raw/ ./internal/app/
+GOTOOLCHAIN=go1.27.1 go test ./internal/exiftool/ ./internal/exporter/ ./internal/fsutil/ ./internal/raw/ ./internal/app/
 ```
 
 `internal/exiftool` covers binary discovery: the `RAWDROP_EXIFTOOL`/env
@@ -654,11 +657,20 @@ the runner seam: streamed stdout, capped capture that fails with
 limit, a bounded prefix read, a command failure that surfaces the helper's
 stderr, and context cancellation that reports `context.Canceled`.
 
-`internal/raw` covers the `Inspection` handle: `Info()` is a value copy, and
-`checkSource` refuses to use candidate offsets once the source's size or
-mtime changed (`ErrSourceChanged`). The app and exporter tests below prove a
-photo is inspected exactly once even though inspect and export are separate
-steps.
+`internal/raw` covers the `Inspection` handle and its Runner seam:
+`Info()` is a value copy; `inspectFile` runs the real inspection/export path
+through an injected fake `exiftool.Runner` with `PATH` emptied
+(`TestInspectionRunsWithFakeRunner`), proving no subprocess is needed; the
+`Inspection` exports accurately ordered stages
+(`TestExportReportsStagesInOrder` — extracting before rotating before
+verifying — and the upright case omits rotating); and source identity is
+checked three times. `TestInspectFileRejectsSourceChangedDuringInspection`
+mutates the file while the inspection query is running,
+`TestInspectionRejectsChangeBeforeExport` mutates it between inspection and
+export, and `TestInspectionRejectsChangeDuringExtraction` mutates it while the
+JPEG is being streamed; all must return `ErrSourceChanged` without leaving a
+temp file. `checkSource` also refuses a source, via `os.SameFile` plus
+size/mtime, once it has changed.
 
 `internal/exporter` covers the shared transaction end to end: a verified commit
 that inspects each source once (`TestExportCommitsVerifiedOutput`), a
@@ -667,7 +679,19 @@ no-full-resolution-JPEG failure that stays discoverable with
 export that leaves no temp file (`TestExportCancellation`), a pre-existing
 output that is never overwritten (`TestExportAvoidsOverwritingExistingOutput`),
 and many exports racing for the same planned name that all commit distinct
-files (`TestExportConcurrentCollisions`).
+files (`TestExportConcurrentCollisions`). `TestExportPrecommitFailureLeavesNoOutput`
+injects a failure in the flush/chmod/hash step that now runs before the
+no-replace link, and asserts the output folder contains neither a visible JPEG
+nor a temp file. `TestExportReportsNoRotationWhenNotNeeded` pins the
+`inspecting` → `extracting` progress sequence for an upright photo.
+
+`internal/fsutil` covers the commit primitive directly:
+`TestCommitNewLinksAndRemovesTemp` (content visible, temp cleaned up),
+`TestCommitNewRefusesExistingDestination` (an existing file is untouched and
+the temp remains for the caller), and
+`TestCommitNewSucceedsWhenTempCannotBeRemoved` (the hard link is the commit
+point, so a failed temp unlink still reports success).
+`TestUniquePath` pins the ` (2)`, ` (3)` suffix sequence.
 
 `internal/app` exercises the pool without a display, seeding a job directly and
 pointing `RAWDROP_EXIFTOOL` at a fake helper:

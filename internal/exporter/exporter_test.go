@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -321,6 +322,65 @@ func TestExportConcurrentCollisions(t *testing.T) {
 		t.Errorf("outDir has %d entries, want %d (sentinel + outputs)", len(entries), n+1)
 	}
 	assertNoTemps(t, outDir)
+}
+
+// TestExportPrecommitFailureLeavesNoOutput injects a failure in the pre-commit
+// step (flush/chmod/hash) after the temp file was written but before the
+// no-replace link. A failed export must leave no visible JPEG and no temp.
+func TestExportPrecommitFailureLeavesNoOutput(t *testing.T) {
+	jpeg := encodeJPEG(t, 640, 480)
+	srcDir := t.TempDir()
+	outDir := t.TempDir()
+	jpegPath := filepath.Join(srcDir, "jpeg.bin")
+	if err := os.WriteFile(jpegPath, jpeg, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := writeFakeExifTool(t, inspectionJSON(640, 480, len(jpeg)), "    cat '"+jpegPath+"'\n", "")
+	t.Setenv(exiftool.EnvExifTool, bin)
+	src := writeSource(t, srcDir, "a.CR2", jpeg)
+
+	injected := errors.New("injected pre-commit failure")
+	_, err := export(context.Background(), src, Options{OutputDir: outDir}, func(string) (string, error) {
+		return "", injected
+	})
+	if !errors.Is(err, injected) {
+		t.Fatalf("export() error = %v, want the injected pre-commit failure", err)
+	}
+	entries, readErr := os.ReadDir(outDir)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 0 {
+		t.Errorf("outDir has %d entries after a pre-commit failure, want 0", len(entries))
+	}
+	assertNoTemps(t, outDir)
+}
+
+// TestExportReportsNoRotationWhenNotNeeded checks the progress stages for an
+// upright source: inspecting then extracting, with no rotation stage.
+func TestExportReportsNoRotationWhenNotNeeded(t *testing.T) {
+	jpeg := encodeJPEG(t, 640, 480)
+	srcDir := t.TempDir()
+	outDir := t.TempDir()
+	jpegPath := filepath.Join(srcDir, "jpeg.bin")
+	if err := os.WriteFile(jpegPath, jpeg, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := writeFakeExifTool(t, inspectionJSON(640, 480, len(jpeg)), "    cat '"+jpegPath+"'\n", "")
+	t.Setenv(exiftool.EnvExifTool, bin)
+	src := writeSource(t, srcDir, "a.CR2", jpeg)
+
+	var stages []Stage
+	if _, err := Export(context.Background(), src, Options{
+		OutputDir:          outDir,
+		CorrectOrientation: true,
+		Progress:           func(p Progress) { stages = append(stages, p.Stage) },
+	}); err != nil {
+		t.Fatalf("Export() error: %v", err)
+	}
+	if want := []Stage{StageInspect, StageExtract}; !slices.Equal(stages, want) {
+		t.Errorf("stages = %v, want %v", stages, want)
+	}
 }
 
 func assertNoTemps(t *testing.T, dir string) {

@@ -63,6 +63,15 @@ capture, and prefix reads. It knows nothing about RAW formats or ExifTool's
 tags. `raw` and `thumb` interpret tags and bytes; `raw` keeps jpegtran
 discovery and rotation because those are specific to lossless rotation.
 
+Helper execution goes through the `exiftool.Runner` interface, which is a real
+test seam rather than documentation-only indirection. `raw.InspectFile`
+resolves the default binary once and stores the resulting runner on the
+`Inspection`; the same runner performs every ExifTool call for inspection and
+export. Package tests call the unexported `inspectFile` with a fake `Runner`,
+so the real inspection/export path runs with no subprocess, no fake executable,
+and no global mutable runner. `thumb` constructs `exiftool.New` directly and
+tests it with a fake executable.
+
 `internal/exporter` is the shared one-photo transaction: inspect once through
 `raw.InspectFile`, extract, apply the metadata policy, verify, and commit into
 the destination with a no-replace link and a final hash. It imports neither
@@ -215,11 +224,15 @@ A missing/full-size-preview condition produces skipped, not failed.
 The exporter inspects the source exactly once. `raw.InspectFile` returns an
 `Inspection` handle that keeps the metadata **and** the embedded-JPEG
 candidates, and the same handle performs the extraction. There is no separate
-second ExifTool read for Inspect and Export. Before extraction the handle
-re-stats the source and refuses to use candidate byte offsets if the file's
-size or modification time changed, so a source replaced between inspect and
-extract fails (or is re-inspected by the caller) instead of extracting from a
-stale offset.
+second ExifTool read for Inspect and Export. Inspection stats the source
+**before** reading any metadata and again **after** probing the candidates;
+the stat must describe the same file with the same size and modification time
+(`os.SameFile` plus size/mtime), otherwise inspection fails with
+`ErrSourceChanged`. A stat failure is propagated rather than silently
+disabling the check. Before extraction the handle re-stats the source, and
+after extraction finishes it re-stats once more, before metadata work or
+verification, so an edit made between inspect and export — or during the
+extraction itself — is refused instead of exporting from stale byte offsets.
 
 `raw.Export` and `raw.Inspect` remain as thin compatibility wrappers over this
 handle for callers that do not need to share an inspection.
@@ -282,8 +295,10 @@ Before commit, the temporary file must:
 
 The write path has no resize or JPEG-encode step: the embedded JPEG is streamed
 out by ExifTool, and an orientation change is a `jpegtran -perfect` DCT
-transform. The final SHA-256 is computed after commit and stored in the
-journal. The hash is the resume-time integrity check for the committed output.
+transform. The final SHA-256 is computed on the finished temp file before the
+no-replace link, so it describes the committed bytes without introducing a
+post-commit failure point. It is stored in the journal and is the resume-time
+integrity check for the committed output.
 
 ## 3. Safe-write algorithm
 
@@ -304,23 +319,28 @@ export_one(item):                          # internal/exporter.Export
     # 3. extract and apply the metadata policy into temp; verify before commit
     insp.Export(temp, options)            # verify_jpeg happens inside here
 
-    # 4. choose a name, then commit with an atomic no-replace operation
+    # 4. finish every fallible content step while temp is still invisible:
+    #    flush it, make it a normal readable photo, hash it
+    chmod(temp, 0644)
+    fsync(temp)
+    hash = sha256(temp)
+    # a failure here removes temp and returns an error: nothing is visible
+
+    # 5. choose a name, then commit with an atomic no-replace operation
     name = planned_output_name or stem + ".jpg"
     for attempt in 1 .. max_name_attempts:
         dest = fsutil.UniquePath(dest_dir, name)   # planning aid only
         fsutil.CommitNew(temp, dest):
             if lstat(dest) exists: return EEXIST
             os.Link(temp, dest)               # atomic; refuses to replace
-            os.Remove(temp)
+            remove(temp)                      # best-effort cleanup
         on EEXIST: continue                   # a concurrent writer took the name
         on success or other error: break
+    # os.Link is the commit point: after it succeeds, the export is success even
+    # if unlinking temp failed; the caller's deferred cleanup covers that.
 
-    # 5. make the directory entry durable and the file normally readable
-    chmod(dest, 0644)
+    # 6. advisory directory sync; report the precomputed hash
     fsutil.SyncDir(dest_dir)
-
-    # 6. hash the committed file; the app records status=done in the journal
-    hash = sha256(dest)
     return Result{output_path, hash, dimensions, orientation, warning, ...}
 ```
 
@@ -330,6 +350,11 @@ Invariants:
   created inside the chosen output folder.
 - **Verification happens before the final name appears.** A failed extraction
   or verification never creates a visible `.jpg`.
+- **All fallible content work happens before the link.** Chmod, the durable
+  flush, and the SHA-256 are computed on the still-invisible temp file. After
+  the no-replace link the exporter only reports success, so a permission or
+  hashing error can never leave a visible output while the item is marked
+  failed.
 - **The hard link is the authority.** `UniquePath` is only a race-reducing
   suggestion. `os.Link` fails with `EEXIST` if another writer — a process, or
   one of the pool's own workers — created the name after the check. The
@@ -337,7 +362,7 @@ Invariants:
   anything.
 - **The file is flushed and closed before its final name appears.** The
   extracted JPEG is fsynced, all metadata/rotation helpers close the temp
-  file, and the destination directory is synced after the link.
+  file, and the finished temp is synced again before the link.
 - **The journal is written last.** A file is not reported as done until its
   final path and hash are recorded.
 - **No cross-device link.** A destination on another filesystem is not
@@ -451,10 +476,16 @@ canceled. Cancel cancels the context, terminates running helpers, keeps every
 committed file, and marks unfinished items canceled.
 
 `verifying` is part of the model's vocabulary, but the exporter validates the
-JPEG inside `Inspection.Export` before committing. The exporter reports only
-three progress stages — `inspecting`, `extracting`, and `rotating` — so the UI
-may move from `rotating` directly to `done` without persisting a separate
-`verifying` update.
+JPEG inside `Inspection.Export` before committing. `raw.Inspection.Export`
+emits its own coarse stages at the point they actually begin — `extracting`
+before the candidate is streamed, `rotating` immediately before a lossless
+rotation is attempted (and only when one is needed), `verifying` before the
+finished temp file is checked. The exporter maps extracting and rotating to its
+`extracting` and `rotating` UI stages and ignores verifying. Because the raw
+stages arrive in real order, the UI never shows `rotating` while extraction is
+still running, and may move from `rotating` directly to `done` without
+persisting a separate `verifying` update. No stage carries a within-file
+percentage.
 
 `done` is revalidated on load: the output must exist, not be a directory, and
 match the stored SHA-256 (when a hash was recorded). A missing or modified
@@ -698,5 +729,8 @@ stage (`IMG_3128.CR2 — Extracting the camera JPEG…`), and the success count
 separately. Between files, and when paused or canceling, it shows
 `Preparing…`, `Paused` or `Canceling…` instead. RawDrop never fabricates a
 within-file percentage, because ExifTool and `jpegtran` cannot report per-file
-progress. The active-file line replaces the old startup text as soon as work
+progress. The active stage names are emitted in real order by the raw export
+(extracting, then rotating only when a rotation is needed, then verifying), so
+the UI cannot claim to be rotating while the embedded JPEG is still being
+extracted. The active-file line replaces the old startup text as soon as work
 begins.

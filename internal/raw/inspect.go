@@ -9,10 +9,12 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-	"time"
+
+	"rawdrop/internal/exiftool"
 )
 
 // Inspection is one complete reading of a RAW file: the summary Inspect
@@ -26,13 +28,17 @@ type Inspection struct {
 	info       Info
 	candidates []candidate
 
+	// runner executes the exiftool helper for both inspection and export.
+	// Production InspectFile installs a real exiftool.Binary; tests can
+	// install a fake Runner so the whole path runs with no subprocess.
+	runner exiftool.Runner
+
 	// source is the absolute path the inspection read.
 	source string
-	// size and modTime record the source's identity so Export can refuse to
-	// use stale candidate offsets if the file changed in between.
-	size     int64
-	modTime  time.Time
-	identity bool
+	// identity is the source's stat captured before inspection. Export
+	// re-stats the source and refuses to use stale candidate offsets when the
+	// file changed.
+	identity os.FileInfo
 }
 
 // candidate is one embedded JPEG tag found in a RAW file. Offsets are byte
@@ -90,6 +96,17 @@ type exifDoc map[string]any
 // returns a complete Inspection handle. It is the single inspection an item
 // needs; pass the handle to Inspection.Export.
 func InspectFile(ctx context.Context, src string) (*Inspection, error) {
+	bin, err := exiftoolPath()
+	if err != nil {
+		return nil, err
+	}
+	return inspectFile(ctx, src, exiftool.New(bin))
+}
+
+// inspectFile is the seam behind InspectFile. Production resolves the default
+// exiftool binary and passes a real Runner; tests pass a fake Runner and run
+// no subprocess at all.
+func inspectFile(ctx context.Context, src string, runner exiftool.Runner) (*Inspection, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -97,11 +114,14 @@ func InspectFile(ctx context.Context, src string) (*Inspection, error) {
 	if err != nil {
 		return nil, err
 	}
-	bin, err := exiftoolPath()
+	// Capture the source's identity before reading anything, so a file that
+	// changes during inspection is rejected instead of being exported from
+	// stale candidate offsets. A stat failure is propagated, never ignored.
+	before, err := os.Stat(src)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("raw: stat source: %w", err)
 	}
-	doc, err := readExifDoc(ctx, bin, src, inspectSelectors)
+	doc, err := readExifDoc(ctx, runner, src, inspectSelectors)
 	if err != nil {
 		return nil, err
 	}
@@ -109,25 +129,36 @@ func InspectFile(ctx context.Context, src string) (*Inspection, error) {
 	if err != nil {
 		return nil, err
 	}
+	insp.runner = runner
 	for i := range insp.candidates {
-		insp.candidates[i].probe(ctx, src)
+		insp.candidates[i].probe(ctx, runner, src)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	insp.info.choosePreview(insp.candidates)
-	insp.source = src
-	if st, err := os.Stat(src); err == nil {
-		insp.size, insp.modTime, insp.identity = st.Size(), st.ModTime(), true
+	after, err := os.Stat(src)
+	if err != nil {
+		return nil, fmt.Errorf("raw: re-stat source: %w", err)
 	}
+	if !sameSource(before, after) {
+		return nil, fmt.Errorf("%w: %s", ErrSourceChanged, filepath.Base(src))
+	}
+	insp.source = src
+	insp.identity = after
 	return &insp, nil
 }
 
+// sameSource reports whether two stats describe the same unchanged file.
+func sameSource(a, b os.FileInfo) bool {
+	return os.SameFile(a, b) && a.Size() == b.Size() && a.ModTime().Equal(b.ModTime())
+}
+
 // readExifDoc asks ExifTool for specific tags as JSON.
-func readExifDoc(ctx context.Context, bin, path string, selectors []string) (exifDoc, error) {
+func readExifDoc(ctx context.Context, runner exiftool.Runner, path string, selectors []string) (exifDoc, error) {
 	args := append([]string{"-j", "-n", "-G1"}, selectors...)
 	args = append(args, "--", path)
-	out, err := captureTool(ctx, bin, args)
+	out, err := runner.Capture(ctx, args, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -202,18 +233,14 @@ func findCandidate(doc exifDoc, tag string) (candidate, bool) {
 // reads the header at the tag's reported offset when possible, and otherwise
 // streams only the beginning of the tag from ExifTool. Failures are not
 // fatal: Export re-extracts and validates the candidate anyway.
-func (c *candidate) probe(ctx context.Context, src string) {
+func (c *candidate) probe(ctx context.Context, runner exiftool.Runner, src string) {
 	if c.hasOffset {
 		if w, h, err := jpegDimensionsAt(src, c.start, c.length); err == nil {
 			c.width, c.height, c.dimsKnown = w, h, true
 			return
 		}
 	}
-	bin, err := exiftoolPath()
-	if err != nil {
-		return
-	}
-	data, err := toolPrefix(ctx, bin, []string{"-b", "-" + c.selector(), "--", src}, jpegHeaderLimit)
+	data, err := runner.Prefix(ctx, []string{"-b", "-" + c.selector(), "--", src}, jpegHeaderLimit)
 	if err != nil {
 		return
 	}

@@ -103,6 +103,13 @@ const maxNameAttempts = 64
 // export, so a caller that also needs Info should read it from Progress rather
 // than calling raw.Inspect again.
 func Export(ctx context.Context, source string, opts Options) (Result, error) {
+	return export(ctx, source, opts, finishTemp)
+}
+
+// export is Export with the pre-commit step injected. Tests supply a failing
+// precommit to prove that content/permission/hash failures happen before the
+// no-replace link and therefore leave nothing visible.
+func export(ctx context.Context, source string, opts Options, precommit func(string) (string, error)) (Result, error) {
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
@@ -149,9 +156,15 @@ func Export(ctx context.Context, source string, opts Options) (Result, error) {
 		PreserveLocation:   opts.PreserveLocation,
 	}
 	if opts.Progress != nil {
-		opts.Progress(Progress{Stage: StageExtract, Info: info})
-		if opts.CorrectOrientation && info.Orientation >= 2 && info.Orientation <= 8 {
-			opts.Progress(Progress{Stage: StageRotate, Info: info})
+		// raw emits extraction and rotation in real order, so the caller never
+		// sees a rotation stage while extraction is still running.
+		rawOpts.Progress = func(stage raw.Stage) {
+			switch stage {
+			case raw.StageExtracting:
+				opts.Progress(Progress{Stage: StageExtract, Info: info})
+			case raw.StageRotating:
+				opts.Progress(Progress{Stage: StageRotate, Info: info})
+			}
 		}
 	}
 
@@ -160,23 +173,21 @@ func Export(ctx context.Context, source string, opts Options) (Result, error) {
 		return Result{}, err
 	}
 
+	// Do every fallible content operation before the file becomes visible:
+	// flush it, make it a normal readable photo, and hash it. After the
+	// no-replace link below, the export is committed and only success is
+	// reported, so a failure here can never leave a visible output.
+	hash, err := precommit(tempPath)
+	if err != nil {
+		return Result{}, err
+	}
+
 	dest, err := commit(ctx, tempPath, dir, name)
 	if err != nil {
 		return Result{}, err
 	}
-	// Make the directory entry durable. Failure is advisory on platforms that
-	// do not permit directories to be opened for syncing.
+	// Advisory: flush the directory entry on filesystems that need it.
 	_ = fsutil.SyncDir(dir)
-
-	// Temporary files are created 0600; a finished export should be a normal,
-	// readable photo.
-	if err := os.Chmod(dest, 0o644); err != nil {
-		return Result{}, fmt.Errorf("exporter: set output permissions: %w", err)
-	}
-	hash, err := hashFile(dest)
-	if err != nil {
-		return Result{}, fmt.Errorf("exporter: verify output: %w", err)
-	}
 
 	return Result{
 		Source:          source,
@@ -190,6 +201,33 @@ func Export(ctx context.Context, source string, opts Options) (Result, error) {
 		MetadataCleaned: res.MetadataCleaned,
 		SHA256:          hash,
 	}, nil
+}
+
+// finishTemp performs the last fallible work on a completed temp file before
+// it is linked into place: flush it to disk, make it a normal readable photo,
+// and return its SHA-256. It never renames or links anything, so if it fails
+// the output folder still contains no visible JPEG.
+func finishTemp(path string) (string, error) {
+	if err := os.Chmod(path, 0o644); err != nil {
+		return "", fmt.Errorf("exporter: set output permissions: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return "", fmt.Errorf("exporter: flush output: %w", err)
+	}
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if syncErr != nil {
+		return "", fmt.Errorf("exporter: flush output: %w", syncErr)
+	}
+	if closeErr != nil {
+		return "", fmt.Errorf("exporter: flush output: %w", closeErr)
+	}
+	hash, err := hashFile(path)
+	if err != nil {
+		return "", fmt.Errorf("exporter: verify output: %w", err)
+	}
+	return hash, nil
 }
 
 // commit links the finished temp file to a fresh name in dir without replacing

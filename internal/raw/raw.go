@@ -58,6 +58,23 @@ type Info struct {
 	PreviewWidth, PreviewHeight int
 }
 
+// Stage identifies a coarse step of an export for progress reporting. It is
+// deliberately not a percentage: the helpers cannot report per-file progress,
+// so callers must not fabricate one.
+type Stage string
+
+const (
+	// StageExtracting is emitted immediately before the embedded JPEG is
+	// streamed into the temporary file.
+	StageExtracting Stage = "extracting"
+	// StageRotating is emitted immediately before a lossless rotation is
+	// attempted, and only when one is actually needed.
+	StageRotating Stage = "rotating"
+	// StageVerifying is emitted immediately before the finished temporary file
+	// is validated.
+	StageVerifying Stage = "verifying"
+)
+
 // Options controls an export.
 type Options struct {
 	// CorrectOrientation rotates photos upright with a lossless jpegtran
@@ -68,6 +85,11 @@ type Options struct {
 	// PreserveLocation keeps GPS and other location tags. When false (the
 	// default for a zero Options) location metadata is removed.
 	PreserveLocation bool
+	// Progress, when non-nil, is called at the start of each export stage. It
+	// runs on the exporting goroutine and must not block. Stages are emitted
+	// in real order, so a caller never sees StageRotating before
+	// StageExtracting.
+	Progress func(Stage)
 }
 
 // Result describes a successful export.

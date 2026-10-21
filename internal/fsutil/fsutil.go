@@ -13,6 +13,11 @@ import (
 
 // CommitNew atomically makes temp visible at dst. It fails rather than
 // replacing dst if dst exists. temp must be on the same filesystem as dst.
+//
+// The hard link is the commit point: once os.Link succeeds, dst is the
+// committed output. Removing temp is best-effort cleanup, because a failure to
+// unlink temp must not turn a successful commit into a reported failure; the
+// caller is expected to remove temp on its own cleanup path.
 func CommitNew(temp, dst string) error {
 	if _, err := os.Lstat(dst); err == nil {
 		return os.ErrExist
@@ -24,7 +29,8 @@ func CommitNew(temp, dst string) error {
 	if err := os.Link(temp, dst); err != nil {
 		return err
 	}
-	return os.Remove(temp)
+	_ = os.Remove(temp)
+	return nil
 }
 
 // UniquePath returns a path in dir based on base that does not exist. It

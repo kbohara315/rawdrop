@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"rawdrop/internal/exiftool"
 	"rawdrop/internal/model"
 )
 
@@ -203,7 +204,7 @@ func TestInspectAndExportRealPortrait(t *testing.T) {
 	if outInfo.Size() < 1<<20 {
 		t.Errorf("output size = %d bytes, want a full-size JPEG over 1 MiB", outInfo.Size())
 	}
-	orientation, gps, err := readOrientationAndGPS(context.Background(), mustExifTool(t), out)
+	orientation, gps, err := readOrientationAndGPS(context.Background(), exiftool.New(mustExifTool(t)), out)
 	if err != nil {
 		t.Fatalf("read output metadata: %v", err)
 	}
@@ -327,7 +328,7 @@ func TestApplyMetadataPerfectFallback(t *testing.T) {
 		t.Fatalf("test fixture is not a valid JPEG: %v", err)
 	}
 
-	rotated, cleaned, warning, err := applyMetadata(context.Background(), path, 6, Options{CorrectOrientation: true})
+	rotated, cleaned, warning, err := applyMetadata(context.Background(), exiftool.New(mustExifTool(t)), path, 6, Options{CorrectOrientation: true})
 	if err != nil {
 		t.Fatalf("applyMetadata() error: %v", err)
 	}
@@ -340,7 +341,7 @@ func TestApplyMetadataPerfectFallback(t *testing.T) {
 	if !cleaned {
 		t.Error("cleaned = false, want true")
 	}
-	orientation, gps, err := readOrientationAndGPS(context.Background(), mustExifTool(t), path)
+	orientation, gps, err := readOrientationAndGPS(context.Background(), exiftool.New(mustExifTool(t)), path)
 	if err != nil {
 		t.Fatalf("read orientation: %v", err)
 	}
@@ -373,7 +374,7 @@ func TestApplyMetadataRotatesSynthetic(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "aligned.jpg")
 	writeJPEGFile(t, path, 64, 48)
 
-	rotated, _, warning, err := applyMetadata(context.Background(), path, 6, Options{CorrectOrientation: true})
+	rotated, _, warning, err := applyMetadata(context.Background(), exiftool.New(mustExifTool(t)), path, 6, Options{CorrectOrientation: true})
 	if err != nil {
 		t.Fatalf("applyMetadata() error: %v", err)
 	}
@@ -388,7 +389,7 @@ func TestApplyMetadataRotatesSynthetic(t *testing.T) {
 	} else if w != 48 || h != 64 {
 		t.Errorf("dimensions = %dx%d, want rotated 48x64", w, h)
 	}
-	orientation, _, err := readOrientationAndGPS(context.Background(), mustExifTool(t), path)
+	orientation, _, err := readOrientationAndGPS(context.Background(), exiftool.New(mustExifTool(t)), path)
 	if err != nil {
 		t.Fatalf("read orientation: %v", err)
 	}
@@ -412,15 +413,15 @@ func TestStripLocationRemovesGPS(t *testing.T) {
 	if _, err := captureTool(context.Background(), bin, args); err != nil {
 		t.Fatalf("adding GPS metadata: %v", err)
 	}
-	if _, gps, err := readOrientationAndGPS(context.Background(), bin, path); err != nil {
+	if _, gps, err := readOrientationAndGPS(context.Background(), exiftool.New(bin), path); err != nil {
 		t.Fatalf("read planted GPS: %v", err)
 	} else if len(gps) == 0 {
 		t.Fatal("planted GPS metadata was not found")
 	}
-	if err := stripLocation(context.Background(), bin, path); err != nil {
+	if err := stripLocation(context.Background(), exiftool.New(bin), path); err != nil {
 		t.Fatalf("stripLocation() error: %v", err)
 	}
-	if _, gps, err := readOrientationAndGPS(context.Background(), bin, path); err != nil {
+	if _, gps, err := readOrientationAndGPS(context.Background(), exiftool.New(bin), path); err != nil {
 		t.Fatalf("read stripped metadata: %v", err)
 	} else if len(gps) != 0 {
 		t.Errorf("location metadata remains: %v", gps)
@@ -524,7 +525,7 @@ func TestExportRealPortraitWithoutRotation(t *testing.T) {
 	if res.Warning != "" {
 		t.Errorf("Warning = %q, want none", res.Warning)
 	}
-	orientation, gps, err := readOrientationAndGPS(context.Background(), bin, out)
+	orientation, gps, err := readOrientationAndGPS(context.Background(), exiftool.New(bin), out)
 	if err != nil {
 		t.Fatalf("read output metadata: %v", err)
 	}
@@ -556,13 +557,19 @@ func TestInspectCancellation(t *testing.T) {
 	script := writeFakeTool(t, "exec sleep 30\n")
 	t.Setenv(envExifTool, script)
 
+	// Inspection now stats the source before reading it, so it must exist.
+	src := filepath.Join(t.TempDir(), "photo.CR2")
+	if err := os.WriteFile(src, []byte("raw placeholder"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
 		time.Sleep(150 * time.Millisecond)
 		cancel()
 	}()
-	_, err := Inspect(ctx, filepath.Join(t.TempDir(), "photo.CR2"))
+	_, err := Inspect(ctx, src)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Inspect() error = %v, want context.Canceled", err)
 	}
@@ -639,7 +646,11 @@ func TestInspectProbesCandidateWithoutOffsets(t *testing.T) {
 			"fi\n")
 	t.Setenv(envExifTool, script)
 
-	info, err := Inspect(context.Background(), filepath.Join(dir, "fake.CR2"))
+	src := filepath.Join(dir, "fake.CR2")
+	if err := os.WriteFile(src, []byte("raw placeholder"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := Inspect(context.Background(), src)
 	if err != nil {
 		t.Fatalf("Inspect() error: %v", err)
 	}
@@ -963,7 +974,7 @@ func TestInspectAndExportRealFormats(t *testing.T) {
 			if w != res.Width || h != res.Height {
 				t.Errorf("output decodes to %dx%d, want the reported %dx%d", w, h, res.Width, res.Height)
 			}
-			orientation, gps, err := readOrientationAndGPS(context.Background(), bin, out)
+			orientation, gps, err := readOrientationAndGPS(context.Background(), exiftool.New(bin), out)
 			if err != nil {
 				t.Fatalf("read output metadata: %v", err)
 			}

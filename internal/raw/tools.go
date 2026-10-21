@@ -34,17 +34,12 @@ func runTool(ctx context.Context, bin string, args []string, stdout io.Writer) e
 	return exiftool.New(bin).Stream(ctx, args, stdout)
 }
 
-// captureTool runs a helper and returns its standard output, which is used
-// for small metadata responses.
+// captureTool runs a helper and returns its standard output, which is used by
+// integration tests that drive a real helper binary. The inspection and export
+// paths use the Runner carried by Inspection instead, so tests can substitute
+// a fake.
 func captureTool(ctx context.Context, bin string, args []string) ([]byte, error) {
 	return exiftool.New(bin).Capture(ctx, args, 0)
-}
-
-// toolPrefix runs a helper and returns at most limit bytes of its standard
-// output, then stops it. Bounded like this, Inspect can read the header of an
-// embedded JPEG without extracting the whole thing to disk or memory.
-func toolPrefix(ctx context.Context, bin string, args []string, limit int64) ([]byte, error) {
-	return exiftool.New(bin).Prefix(ctx, args, limit)
 }
 
 // absolutePath resolves a user-supplied path. Helper binaries treat
