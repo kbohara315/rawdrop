@@ -85,6 +85,29 @@ func TestSnapshots(t *testing.T) {
 	if err := tester.Click("Export 4 photo(s)"); err != nil {
 		t.Fatalf("could not press Export: %v", err)
 	}
+	// Capture a running frame that has a real progress line and an active
+	// photo rather than an empty start.
+	deadline = time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		tester.Frame()
+		if tester.HasText("Extracting the camera JPEG…") || tester.HasText("Reading camera metadata…") ||
+			tester.HasText("Correcting orientation losslessly…") {
+			break
+		}
+		a.mu.Lock()
+		terminal := false
+		for _, item := range a.job.Items {
+			if item.Status.Terminal() {
+				terminal = true
+				break
+			}
+		}
+		a.mu.Unlock()
+		if terminal {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	tester.Frame()
 	writePNG(t, filepath.Join(dir, "exporting.png"), tester.Image())
 

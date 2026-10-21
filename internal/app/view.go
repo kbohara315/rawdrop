@@ -19,6 +19,8 @@ type viewState struct {
 	preserveLocation   bool
 	running            bool
 	paused             bool
+	canceling          bool
+	committed          bool
 	items              []model.Item
 	counts             model.Counts
 }
@@ -36,6 +38,7 @@ func (a *App) snapshot() viewState {
 		preserveLocation:   a.preserveLocation,
 		running:            a.running,
 		paused:             a.paused,
+		canceling:          a.canceling,
 	}
 	a.flash = ""
 	if a.job != nil {
@@ -43,6 +46,9 @@ func (a *App) snapshot() viewState {
 		st.items = make([]model.Item, len(a.job.Items))
 		for i, item := range a.job.Items {
 			st.items[i] = *item
+			if item.OutputPath != "" {
+				st.committed = true
+			}
 		}
 	}
 	return st
@@ -164,14 +170,31 @@ func (a *App) sidebar(c *ui.Context, st viewState) {
 	ui.Column(c).Width(310).HeightPercent(100).Padding(20).Gap(16).
 		BorderWidth(0, 1, 0, 0).BorderColor(t.Border).Children(func() {
 		ui.Column(c).FillWidth().Padding(16).Radius(12).Background(t.Surface).Gap(10).Children(func() {
-			ui.Text(c, "Output folder").FontSize(12).Bold().TextColor(t.TextMuted)
+			ui.Text(c, "Destination").FontSize(12).Bold().TextColor(t.TextMuted)
 			path := st.outputDir
 			if path == "" {
-				path = "Choose a folder for the JPEGs"
+				path = "No destination chosen yet"
 			}
 			ui.Text(c, path).FontSize(13).SingleLine().Ellipsis("…")
-			if st.phase != phaseRunning && ui.Button(c, "Change folder").Clicked() {
-				a.ChooseOutput()
+			switch {
+			case st.committed:
+				ui.Text(c, "This batch already wrote photos. Start a new batch to change the destination.").
+					FontSize(11).TextColor(t.TextMuted)
+			case st.phase == phaseRunning:
+				ui.Text(c, "The destination is locked while an export runs.").
+					FontSize(11).TextColor(t.TextMuted)
+			default:
+				label := "Choose destination…"
+				if st.outputDir != "" {
+					label = "Change destination…"
+				}
+				if ui.Button(c, label).Clicked() {
+					a.ChooseOutput()
+				}
+				if st.outputDir != "" {
+					ui.Text(c, "Created automatically if it does not exist yet.").
+						FontSize(11).TextColor(t.TextMuted)
+				}
 			}
 		})
 
@@ -212,7 +235,13 @@ func (a *App) sidebar(c *ui.Context, st viewState) {
 		if st.phase == phaseRunning {
 			ui.Column(c).Gap(10).Children(func() {
 				ui.Progress(c, progressValue(st.counts)).FillWidth()
-				ui.Text(c, st.status).FontSize(12).TextColor(t.TextMuted).SingleLine()
+				ui.Text(c, progressLabel(st.counts)).FontSize(12)
+				ui.Text(c, runningStage(st)).FontSize(12).TextColor(t.TextMuted).SingleLine().Ellipsis("…")
+				summary := fmt.Sprintf("%d exported", st.counts.Done)
+				if st.counts.Skipped > 0 || st.counts.Failed > 0 {
+					summary += fmt.Sprintf(" · %d skipped · %d failed", st.counts.Skipped, st.counts.Failed)
+				}
+				ui.Text(c, summary).FontSize(11).TextColor(t.TextMuted)
 				ui.Row(c).Gap(8).Children(func() {
 					if st.paused {
 						if ui.PrimaryButton(c, "Resume").Clicked() {
@@ -247,11 +276,73 @@ func (a *App) sidebar(c *ui.Context, st viewState) {
 	})
 }
 
+// processedCount returns the number of items that reached a terminal state.
+// Skipped, failed and canceled are terminal too, so they count as processed.
+func processedCount(c model.Counts) int {
+	return c.Done + c.Skipped + c.Failed + c.Canceled
+}
+
+// progressValue is the determinate fraction (0..1) of items processed. The
+// batch size is known, so the bar is determinate; no per-file guess is used.
 func progressValue(c model.Counts) float64 {
-	if c.Total == 0 {
+	if c.Total <= 0 {
 		return 0
 	}
-	return float64(c.Done+c.Skipped+c.Failed+c.Canceled) / float64(c.Total)
+	v := float64(processedCount(c)) / float64(c.Total)
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
+// progressLabel is the truthful progress line, for example
+// "41% · 68 of 162 processed". The percentage is whole-number and clamped to
+// 100; the count uses "processed" because skipped, failed and canceled items
+// are terminal.
+func progressLabel(c model.Counts) string {
+	if c.Total <= 0 {
+		return "0% · 0 of 0 processed"
+	}
+	percent := processedCount(c) * 100 / c.Total
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	return fmt.Sprintf("%d%% · %d of %d processed", percent, processedCount(c), c.Total)
+}
+
+// runningStage describes what a running export is doing right now: the active
+// file and stage when one is in flight, otherwise the paused, canceling or
+// preparing state. It never fabricates an inside-file percentage.
+func runningStage(st viewState) string {
+	for _, item := range st.items {
+		switch item.Status {
+		case model.StatusInspecting, model.StatusExtracting, model.StatusRotating, model.StatusVerifying:
+			return item.Name + " — " + stageText(item)
+		}
+	}
+	switch {
+	case st.canceling:
+		return "Canceling…"
+	case st.paused:
+		return "Paused"
+	default:
+		return "Preparing…"
+	}
+}
+
+// stageText is the human-readable stage of an active item, preferring the
+// message set by the export loop and falling back to the status label.
+func stageText(item model.Item) string {
+	if msg := strings.TrimSpace(item.Message); msg != "" {
+		return msg
+	}
+	return statusLabel(item)
 }
 
 func (a *App) main(c *ui.Context, st viewState) {

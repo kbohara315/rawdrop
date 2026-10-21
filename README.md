@@ -7,19 +7,30 @@ full-resolution JPEGs. Drop RAW files or a folder, review the thumbnails, and
 export the camera's own embedded JPEGs into a new folder. Originals are only
 ever read.
 
-The MVP is built and validated with Canon `.CR2` files. Other RAW extensions
-are recognized, but a file is exported only when it contains a
-full-resolution embedded JPEG.
+The MVP is built and validated end to end with Canon `.CR2` files. Many other
+RAW extensions, including Sony `.ARW` / `.SRF` / `.SR2`, are recognized, but a
+file is exported only when it contains a full-resolution embedded JPEG. See
+[docs/FORMAT_SUPPORT.md](docs/FORMAT_SUPPORT.md) for the recognized,
+exportable, and verified distinction: recognizing an extension is a routing
+hint, not a camera-compatibility claim.
 
 ## What it does
 
 - Accepts dragged files and folders, plus **Add photos** and **Add folder**
   pickers.
 - Scans folders recursively, deduplicates overlapping drops, ignores
-  non-RAW files inside folders, and excludes the output folder.
+  non-RAW files inside folders, and excludes the output folder. The scanner
+  and the native picker share one recognized-extension list.
 - Shows an upright thumbnail grid with per-photo status.
 - Exports the camera's full-resolution embedded JPEG without resizing or
   re-encoding it.
+- Shows a truthful, determinate progress line while exporting: the percentage
+  and count of photos processed, plus the active file and its stage. It does
+  not fabricate a within-file percentage that ExifTool or `jpegtran` cannot
+  report.
+- Saves the chosen destination to the journal as soon as it is picked, so the
+  choice survives a crash before **Export**. Once a photo is written, the
+  destination is fixed for that batch and a new batch is required to change it.
 - Corrects orientation with a lossless JPEG DCT transform when possible.
 - Keeps location data out by default; preserving it is an explicit opt-in.
 - Writes collision-safe filenames such as `IMG_3128 (2).jpg`; existing files
@@ -156,7 +167,9 @@ its workspace is deleted and recreated on each run.
 3. Choose an output folder. With one source folder the suggested destination
    is a new `JPEG - Full Resolution` folder inside it. With mixed sources,
    RawDrop falls back to `~/Pictures/RawDrop Exports` (or a shared parent
-   folder when one exists).
+   folder when one exists). The destination is saved as soon as you pick it
+   and is created automatically if it does not exist yet. After the first
+   photo is written, it is fixed for the batch; start a new batch to change it.
 4. Leave **Correct orientation** on unless you have a reason not to. Leave
    **Keep location data** off unless you need GPS tags.
 5. Select **Export**. Use **Pause**, **Resume**, and **Cancel** as needed.
@@ -215,11 +228,13 @@ actual dimensions rather than trusting one tag name.
 
 ### A RAW file is recognized but cannot be exported
 
-The scanner accepts many RAW extensions, but the MVP has only been validated
-with Canon `.CR2`. Export requires a full-resolution embedded JPEG and a
+The scanner accepts many RAW extensions, but only Canon `.CR2` has been
+validated end to end. Export requires a full-resolution embedded JPEG and a
 supported metadata layout. A recognized extension is not a promise that every
 camera model works. The file fails or is skipped with a message instead of
-producing a low-quality result.
+producing a low-quality result. See
+[docs/FORMAT_SUPPORT.md](docs/FORMAT_SUPPORT.md) for which formats are
+recognized, exportable, or verified.
 
 ### The destination is rejected or the commit fails
 
@@ -276,6 +291,7 @@ rawdrop/
   scripts/acceptance.sh    # copy-only end-to-end check on real photos
   docs/
     ARCHITECTURE.md        # processing flow, safe writes, recovery, threading
+    FORMAT_SUPPORT.md      # recognized / exportable / verified camera matrix
     TESTING.md             # Ubuntu manual acceptance checklist
   internal/
     app/                   # native UI, export orchestration, workers, snapshots
@@ -293,9 +309,11 @@ UI framework, which keeps the core testable without a window.
 
 ## Current limitations
 
-- **Camera coverage:** Canon `.CR2` is the validated path. Other RAW formats
-  are recognized but not broadly tested; export still requires a
-  full-resolution embedded JPEG.
+- **Camera coverage:** Canon `.CR2` is the validated path. Many other RAW
+  extensions (including Sony `.ARW` / `.SRF` / `.SR2`) are recognized but not
+  yet verified against a real sample; export still requires a full-resolution
+  embedded JPEG. See [docs/FORMAT_SUPPORT.md](docs/FORMAT_SUPPORT.md) for the
+  per-format status.
 - **Output format:** JPEG only. There is no RAW rendering, resizing, JPEG
   re-encoding, or PNG/TIFF/WebP output.
 - **Orientation:** physical correction depends on `jpegtran` and on the JPEG's

@@ -157,18 +157,37 @@ func (j *Job) Finished() bool {
 	return len(j.Items) > 0
 }
 
-// RawExtensions are extensions the scanner offers to the exporter. The
-// exporter still verifies each file's actual metadata; this list only avoids
-// walking unrelated files.
-var RawExtensions = map[string]bool{
-	".cr2": true, ".cr3": true, ".nef": true, ".nrw": true,
-	".arw": true, ".srf": true, ".sr2": true, ".dng": true,
-	".raf": true, ".rw2": true, ".orf": true, ".pef": true,
-	".srw": true, ".raw": true, ".rwl": true, ".3fr": true,
-	".erf": true, ".mef": true, ".mos": true, ".iiq": true,
+// rawExtensionList is the single source of truth for recognized RAW
+// extensions. They are lowercase, dot-free and sorted so the scanner and the
+// native file-picker cannot drift apart. Being listed here only means "route
+// this file to the exporter"; it is not a promise that a camera model's
+// embedded-JPEG layout is exportable. See docs/FORMAT_SUPPORT.md for the
+// recognized/exportable/verified distinction.
+var rawExtensionList = []string{
+	"3fr", "arw", "cr2", "cr3", "dng", "erf", "iiq", "mef", "mos",
+	"nef", "nrw", "orf", "pef", "raf", "raw", "rw2", "rwl", "sr2",
+	"srf", "srw",
 }
 
-// IsRawName reports whether name has a known RAW extension.
+// RawExtensions maps a lowercase, dotted extension to true. It is derived from
+// rawExtensionList so the recognized set has exactly one definition.
+var RawExtensions = func() map[string]bool {
+	m := make(map[string]bool, len(rawExtensionList))
+	for _, ext := range rawExtensionList {
+		m["."+ext] = true
+	}
+	return m
+}()
+
+// RawExtensionList returns the recognized extensions without their leading
+// dots, lowercase and sorted, as a copy. The native picker builds its filter
+// from this list so it always matches the scanner.
+func RawExtensionList() []string {
+	return append([]string(nil), rawExtensionList...)
+}
+
+// IsRawName reports whether name has a known RAW extension. Matching is
+// case-insensitive, so ".CR2" and ".Arw" are recognized.
 func IsRawName(name string) bool {
 	return RawExtensions[strings.ToLower(filepath.Ext(name))]
 }

@@ -149,6 +149,11 @@ folder when none is set.
 Scanning is bounded by a 10-minute context. The result is a job plan, not an
 export: dropping files never starts writing JPEGs.
 
+The recognized extension set is defined once in `model.rawExtensionList` and
+shared with the native picker, so recognition and routing cannot drift.
+Recognizing an extension is a routing hint, not a compatibility claim; see
+section 11 and `docs/FORMAT_SUPPORT.md`.
+
 The item ID is stable for the same input path, but it is not a content
 identity. `Item` also records size and modification time from the scan for
 display and diagnosis. The exporter re-reads the source at export time and
@@ -594,9 +599,51 @@ These are useful to know when reviewing or extending the app:
   unreferenced JPEG. Recovery may export a suffixed duplicate.
 - Stale `.rawdrop-*.jpg` files from a hard kill are not cleaned automatically.
 - The MVP validates Canon `.CR2`; the scanner is broader than the verified
-  exporter coverage.
+  exporter coverage. The recognized, exportable and verified levels are
+  tracked per camera family in `docs/FORMAT_SUPPORT.md`.
 - Physical rotation depends on `jpegtran` and on `-perfect` being applicable;
   metadata-only orientation remains the safe fallback.
 - Hard-link commits restrict destinations to filesystems that support links.
 - Only one job is retained; **New batch** clears the journal rather than
   keeping a history.
+
+## 11. Format support, destination, and progress
+
+### Recognized, exportable, verified
+
+The scanner's recognized set is defined once, in
+`model.rawExtensionList` (`internal/model/model.go`); `RawExtensions` and the
+native picker's filter are derived from it, so the two cannot drift. An
+extension being recognized only routes a file to the exporter. For a given
+file, **exportable** means ExifTool could read the metadata and an embedded
+JPEG reached the 90% full-resolution threshold. **Verified** is a stronger,
+per-camera claim: a representative real sample passed inspect, export,
+orientation, metadata policy, output validation, and unchanged-source checks.
+`docs/FORMAT_SUPPORT.md` records which is which; no non-Canon format is
+verified without such a sample. Recognition, export eligibility, and the
+no-preview-fallback rule are otherwise independent of format.
+
+### Destination persistence
+
+`SetOutputDir` normalizes the chosen path and, when a job exists, writes
+`Settings.OutputDir` to the journal immediately — it does not wait for
+**Export** to become durable. The destination is validated: a path that exists
+and is a regular file is refused, and the refusal is surfaced rather than
+silently ignored; a missing directory is allowed, because the export creates
+it. Changes are refused while an export is running and once the batch has
+committed any output. After the first successful export, the destination is
+fixed for that job and the UI says a new batch is required to change it. This
+keeps a resumed job writing to the folder its completed outputs already used.
+
+### Progress semantics
+
+The batch size is known, so the progress bar is determinate:
+`processed / total`, with `processed` counting done, skipped, failed and
+canceled items because all four are terminal. The sidebar shows a whole-number
+percentage and a count (`41% · 68 of 162 processed`), the active photo and its
+stage (`IMG_3128.CR2 — Extracting the camera JPEG…`), and the success count
+separately. Between files, and when paused or canceling, it shows
+`Preparing…`, `Paused` or `Canceling…` instead. RawDrop never fabricates a
+within-file percentage, because ExifTool and `jpegtran` cannot report per-file
+progress. The active-file line replaces the old startup text as soon as work
+begins.

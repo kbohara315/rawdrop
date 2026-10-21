@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -228,5 +230,170 @@ func TestLoadPreviousValidatesOutputs(t *testing.T) {
 	}
 	if a.phase != phaseReady || a.banner == "" {
 		t.Errorf("phase = %v banner = %q, want a resume banner", a.phase, a.banner)
+	}
+}
+
+// TestProgressHelpers pins the determinate progress value and the truthful
+// label: skipped, failed and canceled items are terminal, so they count as
+// processed.
+func TestProgressHelpers(t *testing.T) {
+	tests := []struct {
+		name      string
+		counts    model.Counts
+		wantValue float64
+		wantLabel string
+	}{
+		{"zero", model.Counts{}, 0, "0% · 0 of 0 processed"},
+		{"initial", model.Counts{Total: 162}, 0, "0% · 0 of 162 processed"},
+		{"intermediate", model.Counts{Total: 162, Done: 60, Skipped: 6, Failed: 1, Canceled: 1}, 68.0 / 162.0, "41% · 68 of 162 processed"},
+		{"mostly done", model.Counts{Total: 4, Done: 3}, 0.75, "75% · 3 of 4 processed"},
+		{"skips and failures are terminal", model.Counts{Total: 5, Done: 2, Skipped: 1, Failed: 2}, 1, "100% · 5 of 5 processed"},
+		{"all done", model.Counts{Total: 4, Done: 4}, 1, "100% · 4 of 4 processed"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := progressValue(tt.counts); math.Abs(got-tt.wantValue) > 1e-9 {
+				t.Errorf("progressValue() = %v, want %v", got, tt.wantValue)
+			}
+			if got := progressLabel(tt.counts); got != tt.wantLabel {
+				t.Errorf("progressLabel() = %q, want %q", got, tt.wantLabel)
+			}
+		})
+	}
+}
+
+// TestRunningStage checks the active-file/stage line and the paused,
+// canceling and preparing fallbacks. No inside-file percentage is invented.
+func TestRunningStage(t *testing.T) {
+	active := viewState{items: []model.Item{{
+		Name: "IMG_0001.CR2", Status: model.StatusExtracting, Message: "Extracting the camera JPEG…",
+	}}}
+	if got, want := runningStage(active), "IMG_0001.CR2 — Extracting the camera JPEG…"; got != want {
+		t.Errorf("runningStage(active) = %q, want %q", got, want)
+	}
+	if got, want := runningStage(viewState{paused: true}), "Paused"; got != want {
+		t.Errorf("runningStage(paused) = %q, want %q", got, want)
+	}
+	if got, want := runningStage(viewState{canceling: true}), "Canceling…"; got != want {
+		t.Errorf("runningStage(canceling) = %q, want %q", got, want)
+	}
+	if got, want := runningStage(viewState{}), "Preparing…"; got != want {
+		t.Errorf("runningStage(empty) = %q, want %q", got, want)
+	}
+	queued := viewState{items: []model.Item{{Name: "IMG_0002.CR2", Status: model.StatusQueued}}, paused: true}
+	if got, want := runningStage(queued), "Paused"; got != want {
+		t.Errorf("runningStage(queued, paused) = %q, want %q", got, want)
+	}
+	fresh := viewState{items: []model.Item{{Name: "IMG_0003.CR2", Status: model.StatusRotating}}}
+	if got, want := runningStage(fresh), "IMG_0003.CR2 — Rotating losslessly…"; got != want {
+		t.Errorf("runningStage(fresh) = %q, want %q", got, want)
+	}
+}
+
+// TestSetOutputDirPersistsToJournal checks that a destination chosen before
+// Export is written to the journal immediately, not only when the export
+// starts.
+func TestSetOutputDirPersistsToJournal(t *testing.T) {
+	in := t.TempDir()
+	if err := os.WriteFile(filepath.Join(in, "IMG_0001.CR2"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := t.TempDir()
+	a := New()
+	a.loadPreviousFrom(stateDir)
+	t.Cleanup(func() { closeStore(a) })
+	a.AddPaths([]string{in})
+
+	out := filepath.Join(t.TempDir(), "exports")
+	a.SetOutputDir(out)
+
+	a.mu.Lock()
+	gotDir := a.outputDir
+	gotJobDir := ""
+	if a.job != nil {
+		gotJobDir = a.job.Settings.OutputDir
+	}
+	a.mu.Unlock()
+	if gotDir != out {
+		t.Fatalf("outputDir = %q, want %q", gotDir, out)
+	}
+	if gotJobDir != out {
+		t.Fatalf("job.Settings.OutputDir = %q, want %q", gotJobDir, out)
+	}
+
+	data, err := os.ReadFile(filepath.Join(stateDir, "jobs.json"))
+	if err != nil {
+		t.Fatalf("journal was not written: %v", err)
+	}
+	var saved model.Job
+	if err := json.Unmarshal(data, &saved); err != nil {
+		t.Fatalf("journal is not valid JSON: %v", err)
+	}
+	if saved.Settings.OutputDir != out {
+		t.Fatalf("journal OutputDir = %q, want %q", saved.Settings.OutputDir, out)
+	}
+}
+
+// TestSetOutputDirRefusesInvalidTargets checks the safety rules: a regular
+// file is not a folder, the destination cannot change while running, and it is
+// fixed once the batch has committed an output.
+func TestSetOutputDirRefusesInvalidTargets(t *testing.T) {
+	in := t.TempDir()
+	if err := os.WriteFile(filepath.Join(in, "IMG_0001.CR2"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := New()
+	a.AddPaths([]string{in})
+	a.mu.Lock()
+	original := a.outputDir
+	a.mu.Unlock()
+	if original == "" {
+		t.Fatal("AddPaths did not choose a default destination")
+	}
+
+	// A regular file is not a folder.
+	file := filepath.Join(t.TempDir(), "not-a-folder")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a.SetOutputDir(file)
+	a.mu.Lock()
+	if a.outputDir != original {
+		t.Errorf("outputDir = %q, want the unchanged %q after a file target", a.outputDir, original)
+	}
+	if a.banner == "" {
+		t.Error("refusing a file destination did not surface an explanation")
+	}
+	a.banner = ""
+	a.mu.Unlock()
+
+	// A change while running is refused.
+	a.mu.Lock()
+	a.running = true
+	a.mu.Unlock()
+	a.SetOutputDir(filepath.Join(t.TempDir(), "running"))
+	a.mu.Lock()
+	a.running = false
+	if a.outputDir != original {
+		t.Errorf("outputDir = %q, want the unchanged %q while running", a.outputDir, original)
+	}
+	if a.banner == "" {
+		t.Error("refusing a change while running did not surface an explanation")
+	}
+	a.banner = ""
+	a.mu.Unlock()
+
+	// Once an output is committed, the destination is fixed for the batch.
+	a.mu.Lock()
+	a.job.Items[0].OutputPath = filepath.Join(t.TempDir(), "IMG_0001.jpg")
+	a.mu.Unlock()
+	a.SetOutputDir(filepath.Join(t.TempDir(), "committed"))
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.outputDir != original {
+		t.Errorf("outputDir = %q, want the unchanged %q after a committed output", a.outputDir, original)
+	}
+	if a.banner == "" {
+		t.Error("refusing a destination change after a committed output did not surface an explanation")
 	}
 }

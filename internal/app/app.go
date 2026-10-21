@@ -56,11 +56,12 @@ type App struct {
 	banner string
 	flash  string
 
-	running bool
-	paused  bool
-	cancel  context.CancelFunc
-	wake    chan struct{}
-	runID   int
+	running   bool
+	paused    bool
+	cancel    context.CancelFunc
+	wake      chan struct{}
+	runID     int
+	canceling bool
 
 	scanning     bool
 	pendingPaths []string
@@ -346,20 +347,67 @@ func (a *App) startThumbnails(items []*model.Item, runID int) {
 	wg.Wait()
 }
 
-// SetOutputDir records a destination chosen with the native folder dialog.
+// SetOutputDir records a destination chosen with the native folder dialog. The
+// path is normalized, applied to the app and the job, and written to the
+// journal immediately so the choice survives a crash before Export starts.
+//
+// A change is refused, with an explanation, when the export is running or when
+// the batch has already committed an output: once any photo is written, the
+// destination is fixed for that job and a new batch is required. A destination
+// that exists and is a regular file is refused too. A missing directory is
+// allowed; the export creates it.
 func (a *App) SetOutputDir(dir string) {
-	if strings.TrimSpace(dir) == "" {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
 		return
 	}
-	dir, err := filepath.Abs(dir)
+	abs, err := filepath.Abs(dir)
 	if err != nil {
+		a.refuseDestination("That destination could not be used: " + err.Error())
 		return
 	}
+	abs = filepath.Clean(abs)
+
 	a.mu.Lock()
-	a.outputDir = dir
-	if a.job != nil {
-		a.job.Settings.OutputDir = dir
+	switch {
+	case a.running:
+		a.banner = "The destination is fixed while an export is running."
+	case a.job != nil && a.committedOutputLocked():
+		a.banner = "This batch already exported photos. Start a new batch to change the destination."
+	default:
+		if st, statErr := os.Stat(abs); statErr == nil && !st.IsDir() {
+			a.banner = "That destination is a file, not a folder: " + abs
+			break
+		}
+		a.outputDir = abs
+		if a.job != nil {
+			a.job.Settings.OutputDir = abs
+			a.saveLocked()
+		}
+		a.banner = ""
 	}
+	a.mu.Unlock()
+	a.redraw()
+}
+
+// committedOutputLocked reports whether any item has a committed output. It
+// must be called with a.mu held.
+func (a *App) committedOutputLocked() bool {
+	if a.job == nil {
+		return false
+	}
+	for _, item := range a.job.Items {
+		if item.OutputPath != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// refuseDestination surfaces a rejected destination without changing state.
+func (a *App) refuseDestination(message string) {
+	a.mu.Lock()
+	a.banner = message
 	a.mu.Unlock()
 	a.redraw()
 }
@@ -376,7 +424,7 @@ func (a *App) ChoosePhotos() {
 			Multiple: true,
 			Filters: []mygo.FileFilter{{
 				Name:       "RAW photos",
-				Extensions: []string{"cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "dng", "raf", "rw2", "orf", "pef", "srw", "raw", "rwl", "3fr", "erf", "mef", "mos", "iiq"},
+				Extensions: model.RawExtensionList(),
 			}},
 		})
 		if err != nil {
@@ -470,10 +518,11 @@ func (a *App) StartExport() {
 	a.cancel = cancel
 	a.running = true
 	a.paused = false
+	a.canceling = false
 	a.runID++
 	runID := a.runID
 	a.phase = phaseRunning
-	a.status = "Starting…"
+	a.status = "Exporting…"
 	a.banner = ""
 	a.saveLocked()
 	a.mu.Unlock()
@@ -500,6 +549,7 @@ func (a *App) exportLoop(ctx context.Context, runID int) {
 	}
 	a.running = false
 	a.paused = false
+	a.canceling = false
 	cancel := a.cancel
 	a.cancel = nil
 	if ctx.Err() != nil {
@@ -755,6 +805,7 @@ func (a *App) Cancel() {
 		return
 	}
 	a.status = "Canceling…"
+	a.canceling = true
 	cancel := a.cancel
 	paused := a.paused
 	a.paused = false

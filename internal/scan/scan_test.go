@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 	"testing"
 
 	"rawdrop/internal/model"
@@ -321,5 +323,80 @@ func TestCollectIsDeterministic(t *testing.T) {
 		if first.Items[i].OutputName != second.Items[i].OutputName {
 			t.Fatalf("output name changed for %s", first.Items[i].Source)
 		}
+	}
+}
+
+// TestRawExtensionRegistry checks the single source of truth that the native
+// picker and the scanner share: every listed extension is recognized in any
+// case, unrelated names are not, and the map and list cannot drift apart.
+func TestRawExtensionRegistry(t *testing.T) {
+	list := model.RawExtensionList()
+	if !sort.StringsAreSorted(list) {
+		t.Fatalf("RawExtensionList() = %v, want a sorted list", list)
+	}
+	if len(model.RawExtensions) != len(list) {
+		t.Fatalf("RawExtensions has %d entries but RawExtensionList has %d", len(model.RawExtensions), len(list))
+	}
+	for _, ext := range list {
+		if strings.HasPrefix(ext, ".") {
+			t.Errorf("extension %q must not carry a leading dot", ext)
+		}
+		if ext != strings.ToLower(ext) {
+			t.Errorf("extension %q must be lowercase", ext)
+		}
+		if !model.RawExtensions["."+ext] {
+			t.Errorf("RawExtensions is missing .%s", ext)
+		}
+	}
+
+	// Every recognized extension routes, and case is folded. The mixed-case
+	// form is listed explicitly so .ARW/.ARW-style input is covered.
+	for _, ext := range list {
+		mixed := ext[:1] + strings.ToUpper(ext[1:])
+		for _, name := range []string{"a." + ext, "a." + strings.ToUpper(ext), "a." + mixed} {
+			if !model.IsRawName(name) {
+				t.Errorf("IsRawName(%q) = false, want true", name)
+			}
+		}
+	}
+
+	// Sony extensions are recognized even without a verified real sample.
+	for _, ext := range []string{"arw", "srf", "sr2"} {
+		for _, name := range []string{"photo." + ext, "photo." + strings.ToUpper(ext), "PHOTO." + strings.ToUpper(ext)} {
+			if !model.IsRawName(name) {
+				t.Errorf("IsRawName(%q) = false, want true for a recognized Sony extension", name)
+			}
+		}
+	}
+
+	// JPEG, HEIC and unrelated names are not RAW.
+	for _, name := range []string{"photo.jpg", "photo.JPEG", "photo.heic", "photo.txt", "photo", "photo.cr2.jpg", ""} {
+		if model.IsRawName(name) {
+			t.Errorf("IsRawName(%q) = true, want false", name)
+		}
+	}
+}
+
+// TestCollectRecognizesEveryListedExtension drops one file per recognized
+// extension, uppercased, and checks the scanner accepts all of them while an
+// explicitly dropped JPEG is reported as unsupported.
+func TestCollectRecognizesEveryListedExtension(t *testing.T) {
+	root := t.TempDir()
+	var want []string
+	for _, ext := range model.RawExtensionList() {
+		name := "photo-" + ext + "." + strings.ToUpper(ext)
+		want = append(want, writeFile(t, filepath.Join(root, name), "x"))
+	}
+	jpg := writeFile(t, filepath.Join(root, "photo.JPG"), "x")
+
+	res, err := Collect(context.Background(), []string{root, jpg}, "")
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if got := sources(res.Items); !equal(got, want) {
+		t.Fatalf("sources = %v, want %v", got, want)
+	}
+	if len(res.Unsupported) != 1 || res.Unsupported[0] != filepath.Clean(jpg) {
+		t.Fatalf("Unsupported = %v, want just %s", res.Unsupported, jpg)
 	}
 }

@@ -79,6 +79,16 @@ func TestEndToEndDropExportResume(t *testing.T) {
 	if err := tester.Click("Export 4 photo(s)"); err != nil {
 		t.Fatalf("could not press Export: %v", err)
 	}
+	tester.Frame()
+
+	// The running view must show a truthful processed count, not the old
+	// startup text. The bar fraction is determinate over the known batch.
+	if !tester.HasText("processed") {
+		t.Error("the running view did not show a processed progress label")
+	}
+	if tester.HasText("Starting…") {
+		t.Error("the running view still shows the stale Starting… text")
+	}
 
 	// Pause and resume once, through the real buttons.
 	if err := tester.Click("Pause"); err != nil {
@@ -97,6 +107,26 @@ func TestEndToEndDropExportResume(t *testing.T) {
 		t.Fatalf("could not press Resume: %v", err)
 	}
 	tester.Frame()
+
+	// The sidebar shows the active photo and its stage while it works.
+	sawActive := false
+	for i := 0; i < 200 && !sawActive; i++ {
+		a.mu.Lock()
+		running := a.running
+		a.mu.Unlock()
+		if !running {
+			break
+		}
+		tester.Frame()
+		if tester.HasText("Reading camera metadata…") || tester.HasText("Extracting the camera JPEG…") ||
+			tester.HasText("Correcting orientation losslessly…") {
+			sawActive = true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !sawActive {
+		t.Error("the running view never showed the active photo and stage")
+	}
 
 	waitFor(t, 60*time.Second, func() bool {
 		a.mu.Lock()

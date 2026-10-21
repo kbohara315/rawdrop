@@ -589,6 +589,76 @@ rm -rf "$WORK"
 - [ ] The work directory is gone.
 - [ ] The original sample and any pre-existing exports are still present.
 
+## 11. Destination, progress, and format fixtures
+
+These checks cover the destination choice, the honest progress display, and
+per-format verification. They complement the automated suite.
+
+### Destination persistence and locking
+
+Automated coverage:
+
+```sh
+GOTOOLCHAIN=go1.27.1 go test -run 'TestSetOutputDir' ./internal/app/
+```
+
+- `TestSetOutputDirPersistsToJournal` proves the chosen path is written to
+  `jobs.json` immediately, before **Export** starts.
+- `TestSetOutputDirRefusesInvalidTargets` proves a regular file is refused, a
+  change while running is refused, and a change after the first committed
+  output is refused. Each refusal is surfaced.
+
+Manual check:
+
+1. Add photos, pick a destination, and close the app **without** exporting.
+2. Relaunch. The previous-export banner appears and the destination is the one
+   you picked, not the default.
+3. Export one photo, then try **Change destination…**. The button is replaced
+   by a note that this batch already wrote photos and a new batch is required.
+
+- [ ] The destination survives a relaunch before any export.
+- [ ] After the first output, the destination cannot change for that batch.
+- [ ] A destination that is an existing file is rejected with a message.
+
+### Progress display
+
+- [ ] While exporting, the sidebar shows `N% · M of T processed`, the active
+      photo and its stage, and the exported count.
+- [ ] The percentage advances as photos finish; it never shows a per-file
+      percentage that the tools cannot report.
+- [ ] With no active photo the line reads `Preparing…`, `Paused`, or
+      `Canceling…`.
+- [ ] The old startup text never remains once work has begun.
+
+Automated coverage: `TestProgressHelpers`, `TestRunningStage`, and the
+`TestEndToEndDropExportResume` assertions on the real view.
+
+### Per-format verification
+
+A format is not verified until a representative real sample passes the full
+contract. Point the opt-in test at a local folder of samples (never commit
+personal or large photos):
+
+```sh
+RAWDROP_TEST_FORMATS_DIR="/path/to/samples" GOTOOLCHAIN=go1.27.1 \
+  go test -run TestInspectAndExportRealFormats ./internal/raw/ -v
+```
+
+For each sample, confirm from the test log:
+
+- [ ] ExifTool reports a non-empty make and model.
+- [ ] A full-resolution embedded JPEG is found (not a thumbnail or preview).
+- [ ] The exported JPEG decodes to the reported dimensions and keeps the
+      expected orientation; location metadata is gone by default.
+- [ ] The source is byte-for-byte unchanged.
+- [ ] Only the tested camera family is marked **verified** in
+      [docs/FORMAT_SUPPORT.md](FORMAT_SUPPORT.md); every other format stays
+      recognized/unverified.
+
+If a sample has no full-resolution embedded JPEG, stop: do not lower the 90%
+threshold or export a preview. Keep the format recognized/unverified and
+report it.
+
 ## Acceptance record
 
 Automated run on 2026-10-21 through the shared core (`cmd/rawdrop-cli` plus

@@ -16,6 +16,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"rawdrop/internal/model"
 )
 
 // Integration tests use the real Canon EOS 80D sample photos when they are
@@ -815,6 +817,96 @@ func mustExifTool(t *testing.T) string {
 		t.Fatalf("exiftool is required: %v", err)
 	}
 	return bin
+}
+
+// TestInspectAndExportRealFormats runs the full inspect/export contract over
+// every recognized RAW file under RAWDROP_TEST_FORMATS_DIR. It is opt-in
+// because real camera samples are large and personal; nothing is committed to
+// the repository. Point it at a folder of samples for the camera families
+// being evaluated:
+//
+//	RAWDROP_TEST_FORMATS_DIR=/path/to/samples GOTOOLCHAIN=go1.27.1 \
+//	  go test -run TestInspectAndExportRealFormats ./internal/raw/
+//
+// Each sample is opened read-only; every output goes to t.TempDir(). A format
+// is not "verified" in docs/FORMAT_SUPPORT.md until a representative sample
+// from its camera family passes here.
+func TestInspectAndExportRealFormats(t *testing.T) {
+	root := os.Getenv("RAWDROP_TEST_FORMATS_DIR")
+	if root == "" {
+		t.Skip("set RAWDROP_TEST_FORMATS_DIR to a folder of real RAW samples")
+	}
+	requireExifTool(t)
+	bin := mustExifTool(t)
+
+	var files []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if model.IsRawName(path) {
+			files = append(files, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", root, err)
+	}
+	if len(files) == 0 {
+		t.Skipf("no recognized RAW files under %s", root)
+	}
+	sort.Strings(files)
+
+	for _, src := range files {
+		src := src
+		t.Run(filepath.Base(src), func(t *testing.T) {
+			before := statFile(t, src)
+
+			info, err := Inspect(context.Background(), src)
+			if err != nil {
+				t.Fatalf("Inspect() error: %v", err)
+			}
+			t.Logf("%s: make/model %q %q, camera %dx%d orientation %d, preview %s %dx%d (has %v)",
+				filepath.Base(src), info.Make, info.Model, info.Width, info.Height,
+				info.Orientation, info.PreviewTag, info.PreviewWidth, info.PreviewHeight, info.HasPreview)
+			if info.Make == "" || info.Model == "" {
+				t.Errorf("Inspect() make/model empty; the metadata layout is not understood for this format")
+			}
+			if !info.HasPreview {
+				t.Fatalf("no full-resolution embedded JPEG (candidate %s %dx%d, camera %dx%d)",
+					info.PreviewTag, info.PreviewWidth, info.PreviewHeight, info.Width, info.Height)
+			}
+
+			out := filepath.Join(t.TempDir(), "export.jpg")
+			res, err := Export(context.Background(), src, out, Options{CorrectOrientation: true})
+			if err != nil {
+				t.Fatalf("Export() error: %v", err)
+			}
+			w, h, err := validateJPEGFile(out)
+			if err != nil {
+				t.Fatalf("output is not a valid JPEG: %v", err)
+			}
+			if w != res.Width || h != res.Height {
+				t.Errorf("output decodes to %dx%d, want the reported %dx%d", w, h, res.Width, res.Height)
+			}
+			orientation, gps, err := readOrientationAndGPS(context.Background(), bin, out)
+			if err != nil {
+				t.Fatalf("read output metadata: %v", err)
+			}
+			if orientation != res.Orientation {
+				t.Errorf("output EXIF orientation = %d, want %d", orientation, res.Orientation)
+			}
+			if len(gps) != 0 {
+				t.Errorf("output still has location metadata by default: %v", gps)
+			}
+			t.Logf("export: %dx%d orientation %d rotated=%v warning=%q cleaned=%v",
+				res.Width, res.Height, res.Orientation, res.Rotated, res.Warning, res.MetadataCleaned)
+			assertFileUnchanged(t, src, before)
+		})
+	}
 }
 
 // jpegScanData returns a JPEG's compressed image data: everything from the
