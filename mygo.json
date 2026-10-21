@@ -1,0 +1,15 @@
+{
+  "name": "RawDrop",
+  "identifier": "app.rawdrop.desktop",
+  "version": "0.1.0",
+  "copyright": "Copyright 2026 RawDrop contributors",
+  "out": "build",
+  "linux": {
+    "maintainer": "RawDrop contributors <rawdrop@localhost>",
+    "comment": "Export full-resolution JPEGs from RAW photos, locally",
+    "categories": ["Graphics", "Photography", "Utility"],
+    "depends": ["libimage-exiftool-perl", "libjpeg-turbo-progs"],
+    "webview": false,
+    "command": "rawdrop"
+  }
+}
