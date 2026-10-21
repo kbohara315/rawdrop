@@ -196,21 +196,6 @@ func TestJPEGDimensions(t *testing.T) {
 	}
 }
 
-func TestCappedBuffer(t *testing.T) {
-	b := cappedBuffer{max: 4}
-	if n, err := b.Write([]byte("abcdefgh")); n != 8 || err != nil {
-		t.Fatalf("Write = %d, %v; want 8, nil", n, err)
-	}
-	if got := b.String(); !strings.Contains(got, "abcd") || !strings.Contains(got, "truncated") {
-		t.Fatalf("String() = %q, want kept prefix and truncation note", got)
-	}
-	b2 := cappedBuffer{max: 16}
-	b2.Write([]byte(" short "))
-	if got := b2.String(); got != "short" {
-		t.Fatalf("String() = %q, want %q", got, "short")
-	}
-}
-
 func TestCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

@@ -20,7 +20,7 @@ import (
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 
-	"rawdrop/internal/fsutil"
+	"rawdrop/internal/exporter"
 	"rawdrop/internal/journal"
 	"rawdrop/internal/model"
 	"rawdrop/internal/raw"
@@ -59,7 +59,7 @@ type App struct {
 	running   bool
 	paused    bool
 	cancel    context.CancelFunc
-	wake      chan struct{}
+	pauseWait chan struct{}
 	runID     int
 	canceling bool
 
@@ -80,7 +80,7 @@ type App struct {
 // is called, after MyGo has prepared its data directories.
 func New() *App {
 	return &App{
-		wake:               make(chan struct{}, 1),
+		pauseWait:          make(chan struct{}),
 		bitmaps:            make(map[string]*ui.Bitmap),
 		thumbSize:          make(map[string]int),
 		correctOrientation: true,
@@ -502,12 +502,19 @@ func (a *App) StartExport() {
 		a.ChooseOutput()
 		return
 	}
-	// Only queued and failed items are attempted. Completed and skipped
-	// items stay untouched, which makes Resume and Retry safe.
+	// Only queued items are attempted from here on. Failed and canceled items
+	// are requeued once so this Export/Retry picks them up; completed and
+	// skipped items stay untouched. Requeuing up front, rather than selecting
+	// failed items inside the worker loop, keeps a repeatedly failing item from
+	// being retried forever inside a single run.
 	pending := 0
 	for _, item := range a.job.Items {
-		if item.Status == model.StatusQueued || item.Status == model.StatusFailed ||
-			item.Status == model.StatusCanceled {
+		switch item.Status {
+		case model.StatusFailed, model.StatusCanceled:
+			item.Status = model.StatusQueued
+			item.Message = ""
+		}
+		if item.Status == model.StatusQueued {
 			pending++
 		}
 	}
@@ -527,6 +534,7 @@ func (a *App) StartExport() {
 	a.running = true
 	a.paused = false
 	a.canceling = false
+	a.pauseWait = make(chan struct{})
 	a.runID++
 	runID := a.runID
 	a.phase = phaseRunning
@@ -538,18 +546,177 @@ func (a *App) StartExport() {
 	go a.exportLoop(ctx, runID)
 }
 
+// exportWorkers bounds how many photos are exported at once. A small pool keeps
+// ExifTool processes, memory, and disk contention bounded while overlapping the
+// I/O and process time of independent photos. It is an arbitrary safety bound,
+// not a measured optimum.
+const exportWorkers = 3
+
+// exportLoop runs a bounded pool of export workers for one run and finalizes
+// the job only after every worker has stopped, so the final state and the
+// journal save never race with a late worker.
 func (a *App) exportLoop(ctx context.Context, runID int) {
+	var wg sync.WaitGroup
+	for i := 0; i < exportWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			a.exportWorker(ctx, runID)
+		}()
+	}
+	wg.Wait()
+	a.finishExport(ctx, runID)
+}
+
+// exportWorker reserves and exports items until the run ends: the context is
+// canceled, the run is superseded, or no queued item remains.
+func (a *App) exportWorker(ctx context.Context, runID int) {
 	for {
-		item, ok := a.nextItem(ctx, runID)
-		if !ok {
-			break
-		}
+		item := a.reserveItem(ctx, runID)
 		if item == nil {
-			break
+			return
 		}
-		a.exportOne(ctx, runID, item)
+		a.exportItem(ctx, runID, item)
+	}
+}
+
+// reserveItem atomically claims the next queued item by marking it inspecting
+// under the app mutex, so two workers can never take the same photo. It blocks
+// while paused without claiming anything, and returns nil when the run is over.
+// Pause therefore stops new reservations while work already reserved finishes.
+func (a *App) reserveItem(ctx context.Context, runID int) *model.Item {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+		a.mu.Lock()
+		if a.runID != runID {
+			a.mu.Unlock()
+			return nil
+		}
+		if a.paused {
+			wait := a.pauseWait
+			a.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-wait:
+				continue
+			}
+		}
+		var next *model.Item
+		for _, item := range a.job.Items {
+			if item.Status == model.StatusQueued {
+				item.Status = model.StatusInspecting
+				item.Message = "Reading camera metadata…"
+				next = item
+				break
+			}
+		}
+		if next != nil {
+			a.saveLocked()
+		}
+		a.mu.Unlock()
+		if next != nil {
+			a.redraw()
+		}
+		return next
+	}
+}
+
+// exportItem runs one photo through the shared exporter and records the
+// outcome on the item. Progress callbacks run on this worker goroutine and only
+// mutate shared state under App.mu.
+func (a *App) exportItem(ctx context.Context, runID int, item *model.Item) {
+	a.mu.Lock()
+	if a.runID != runID {
+		a.mu.Unlock()
+		return
+	}
+	opts := exporter.Options{
+		OutputDir:          a.job.Settings.OutputDir,
+		OutputName:         item.OutputName,
+		CorrectOrientation: a.job.Settings.CorrectOrientation,
+		PreserveLocation:   a.job.Settings.PreserveLocation,
+	}
+	opts.Progress = func(p exporter.Progress) {
+		a.mu.Lock()
+		if a.runID != runID {
+			a.mu.Unlock()
+			return
+		}
+		item.Status = stageStatus(p.Stage)
+		item.Message = stageMessage(p.Stage)
+		if p.Info.Width > 0 || p.Info.Height > 0 {
+			item.Width, item.Height = p.Info.Width, p.Info.Height
+		}
+		if p.Info.Orientation >= 1 {
+			item.Orientation = p.Info.Orientation
+		}
+		a.saveLocked()
+		a.mu.Unlock()
+		a.redraw()
+	}
+	source := item.Source
+	a.mu.Unlock()
+
+	result, err := exporter.Export(ctx, source, opts)
+	if err != nil {
+		a.finishItem(runID, item, err)
+		return
 	}
 
+	a.mu.Lock()
+	if a.runID != runID {
+		a.mu.Unlock()
+		return
+	}
+	item.Status = model.StatusDone
+	item.OutputPath = result.OutputPath
+	item.OutputName = result.OutputName
+	item.OutputSHA256 = result.SHA256
+	item.Width = result.Width
+	item.Height = result.Height
+	item.Orientation = result.Orientation
+	item.Rotated = result.Rotated
+	item.Warning = result.Warning
+	item.Message = ""
+	item.Thumbnail = nil
+	a.saveLocked()
+	a.mu.Unlock()
+	a.redraw()
+}
+
+// stageStatus maps an exporter stage to the model status the view shows.
+func stageStatus(stage exporter.Stage) model.Status {
+	switch stage {
+	case exporter.StageExtract:
+		return model.StatusExtracting
+	case exporter.StageRotate:
+		return model.StatusRotating
+	default:
+		return model.StatusInspecting
+	}
+}
+
+// stageMessage is the human-readable text for an exporter stage.
+func stageMessage(stage exporter.Stage) string {
+	switch stage {
+	case exporter.StageExtract:
+		return "Extracting the camera JPEG…"
+	case exporter.StageRotate:
+		return "Correcting orientation losslessly…"
+	default:
+		return "Reading camera metadata…"
+	}
+}
+
+// finishExport finalizes a run after every worker has stopped: it leaves the
+// running phase, marks anything still unfinished canceled, saves the journal,
+// and notifies the desktop. A superseded run (runID changed) does nothing.
+func (a *App) finishExport(ctx context.Context, runID int) {
 	a.mu.Lock()
 	if a.runID != runID {
 		a.mu.Unlock()
@@ -600,160 +767,6 @@ func (a *App) exportLoop(ctx context.Context, runID int) {
 	}
 }
 
-// nextItem waits while paused and returns the next item to attempt.
-func (a *App) nextItem(ctx context.Context, runID int) (*model.Item, bool) {
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, false
-		default:
-		}
-		a.mu.Lock()
-		if a.runID != runID {
-			a.mu.Unlock()
-			return nil, false
-		}
-		if a.paused {
-			a.mu.Unlock()
-			select {
-			case <-ctx.Done():
-				return nil, false
-			case <-a.wake:
-				continue
-			}
-		}
-		var next *model.Item
-		for _, item := range a.job.Items {
-			if item.Status == model.StatusQueued || item.Status == model.StatusFailed ||
-				item.Status == model.StatusCanceled {
-				next = item
-				break
-			}
-		}
-		a.mu.Unlock()
-		if next == nil {
-			return nil, true
-		}
-		return next, true
-	}
-}
-
-func (a *App) exportOne(ctx context.Context, runID int, item *model.Item) {
-	a.mu.Lock()
-	outputDir := a.job.Settings.OutputDir
-	opts := raw.Options{
-		CorrectOrientation: a.job.Settings.CorrectOrientation,
-		PreserveLocation:   a.job.Settings.PreserveLocation,
-	}
-	source := item.Source
-	outputName := item.OutputName
-	sourceName := item.Name
-	a.mu.Unlock()
-
-	a.setState(runID, item, model.StatusInspecting, "Reading camera metadata…")
-	info, err := raw.Inspect(ctx, source)
-	if err != nil {
-		a.finishItem(runID, item, err)
-		return
-	}
-	a.mu.Lock()
-	item.Width = info.Width
-	item.Height = info.Height
-	item.Orientation = info.Orientation
-	item.Warning = ""
-	a.mu.Unlock()
-
-	a.setState(runID, item, model.StatusExtracting, "Extracting the camera JPEG…")
-	dir := outputDir
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		a.finishItem(runID, item, fmt.Errorf("create output folder: %w", err))
-		return
-	}
-	temp, err := os.CreateTemp(dir, ".rawdrop-*.jpg")
-	if err != nil {
-		a.finishItem(runID, item, err)
-		return
-	}
-	tempPath := temp.Name()
-	temp.Close()
-	os.Remove(tempPath) // Export requires a path that does not exist yet.
-	defer os.Remove(tempPath)
-
-	if info.Orientation != 1 && opts.CorrectOrientation {
-		a.setState(runID, item, model.StatusRotating, "Correcting orientation losslessly…")
-	}
-	result, err := raw.Export(ctx, source, tempPath, opts)
-	if err != nil {
-		a.finishItem(runID, item, err)
-		return
-	}
-
-	// Pick the final name as late as possible so a file created while the
-	// batch runs is never overwritten.
-	name := outputName
-	if name == "" {
-		name = strings.TrimSuffix(sourceName, filepath.Ext(sourceName)) + ".jpg"
-	}
-	dest := fsutil.UniquePath(dir, name)
-	if err := fsutil.CommitNew(tempPath, dest); err != nil {
-		if errors.Is(err, os.ErrExist) {
-			dest = fsutil.UniquePath(dir, name)
-			err = fsutil.CommitNew(tempPath, dest)
-		}
-		if err != nil {
-			a.finishItem(runID, item, fmt.Errorf("save output: %w", err))
-			return
-		}
-	}
-	_ = fsutil.SyncDir(dir)
-
-	// Temporary files are created with 0600; a finished export should be a
-	// normal, readable photo.
-	if err := os.Chmod(dest, 0o644); err != nil {
-		a.finishItem(runID, item, fmt.Errorf("set output permissions: %w", err))
-		return
-	}
-
-	hash, err := hashFile(dest)
-	if err != nil {
-		a.finishItem(runID, item, fmt.Errorf("verify output: %w", err))
-		return
-	}
-
-	a.mu.Lock()
-	if a.runID != runID {
-		a.mu.Unlock()
-		return
-	}
-	item.Status = model.StatusDone
-	item.OutputPath = dest
-	item.OutputName = filepath.Base(dest)
-	item.OutputSHA256 = hash
-	item.Width = result.Width
-	item.Height = result.Height
-	item.Orientation = result.Orientation
-	item.Rotated = result.Rotated
-	item.Warning = result.Warning
-	item.Message = ""
-	item.Thumbnail = nil
-	a.saveLocked()
-	a.mu.Unlock()
-	a.redraw()
-}
-
-func (a *App) setState(runID int, item *model.Item, status model.Status, message string) {
-	a.mu.Lock()
-	if a.runID != runID {
-		a.mu.Unlock()
-		return
-	}
-	item.Status = status
-	item.Message = message
-	a.saveLocked()
-	a.mu.Unlock()
-	a.redraw()
-}
-
 func (a *App) finishItem(runID int, item *model.Item, err error) {
 	a.mu.Lock()
 	if a.runID != runID {
@@ -775,7 +788,8 @@ func (a *App) finishItem(runID int, item *model.Item, err error) {
 	a.redraw()
 }
 
-// Pause stops scheduling new files; the current file is allowed to finish.
+// Pause stops scheduling new files; photos already in flight are allowed to
+// finish. Workers wait on pauseWait instead of claiming another item.
 func (a *App) Pause() {
 	a.mu.Lock()
 	if !a.running || a.paused {
@@ -788,7 +802,8 @@ func (a *App) Pause() {
 	a.redraw()
 }
 
-// Resume continues a paused export.
+// Resume continues a paused export. Closing pauseWait wakes every waiting
+// worker at once; a fresh channel is left for the next pause.
 func (a *App) Resume() {
 	a.mu.Lock()
 	if !a.running || !a.paused {
@@ -796,16 +811,16 @@ func (a *App) Resume() {
 		return
 	}
 	a.paused = false
+	close(a.pauseWait)
+	a.pauseWait = make(chan struct{})
 	a.status = "Exporting…"
 	a.mu.Unlock()
-	select {
-	case a.wake <- struct{}{}:
-	default:
-	}
 	a.redraw()
 }
 
-// Cancel stops the export but keeps every committed file.
+// Cancel stops the export but keeps every committed file. Canceling the
+// context stops in-flight helpers and also wakes any workers waiting on
+// pauseWait, so a paused export still shuts down.
 func (a *App) Cancel() {
 	a.mu.Lock()
 	if !a.running {
@@ -815,15 +830,8 @@ func (a *App) Cancel() {
 	a.status = "Canceling…"
 	a.canceling = true
 	cancel := a.cancel
-	paused := a.paused
 	a.paused = false
 	a.mu.Unlock()
-	if paused {
-		select {
-		case a.wake <- struct{}{}:
-		default:
-		}
-	}
 	if cancel != nil {
 		cancel()
 	}

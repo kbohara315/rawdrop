@@ -26,6 +26,11 @@ import (
 // why.
 var ErrNoFullJPEG = errors.New("no full-resolution embedded JPEG found")
 
+// ErrSourceChanged reports that a RAW file changed between inspection and
+// export, so the inspection's candidate offsets can no longer be trusted.
+// Callers can test for it with errors.Is; re-inspecting is the safe response.
+var ErrSourceChanged = errors.New("source changed since inspection")
+
 // Info describes a RAW file, read without extracting its embedded JPEG.
 type Info struct {
 	// Width and Height are the camera's usable, rendered image dimensions as
@@ -101,10 +106,14 @@ func CheckTools() error {
 // Inspect reads a RAW file's metadata without extracting the embedded JPEG.
 // The returned Info reports the camera's usable dimensions, EXIF orientation,
 // make and model, and the best embedded full-resolution JPEG candidate.
+//
+// Inspect keeps only the summary. Callers that will also export the file
+// should use InspectFile and pass its handle to Export, so the file is
+// inspected only once.
 func Inspect(ctx context.Context, src string) (Info, error) {
-	insp, err := inspectFile(ctx, src)
+	insp, err := InspectFile(ctx, src)
 	if err != nil {
 		return Info{}, err
 	}
-	return insp.info, nil
+	return insp.Info(), nil
 }

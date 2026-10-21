@@ -12,14 +12,27 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
-// inspection is the internal result of reading a RAW file: the public Info
-// plus every embedded JPEG candidate, which Export uses to pick what to
-// extract.
-type inspection struct {
+// Inspection is one complete reading of a RAW file: the summary Inspect
+// reports, plus every embedded JPEG candidate Export needs to pick what to
+// extract. Producing it once and handing the handle to Export means a photo is
+// inspected a single time instead of once for Inspect and again for Export.
+//
+// The handle is safe to read through Info from multiple goroutines; it is not
+// mutated after it is built.
+type Inspection struct {
 	info       Info
 	candidates []candidate
+
+	// source is the absolute path the inspection read.
+	source string
+	// size and modTime record the source's identity so Export can refuse to
+	// use stale candidate offsets if the file changed in between.
+	size     int64
+	modTime  time.Time
+	identity bool
 }
 
 // candidate is one embedded JPEG tag found in a RAW file. Offsets are byte
@@ -73,36 +86,41 @@ var inspectSelectors = []string{
 // group prefix such as "IFD0:ImageWidth".
 type exifDoc map[string]any
 
-// inspectFile reads src's metadata, probes the embedded JPEG headers, and
-// reports the best candidate.
-func inspectFile(ctx context.Context, src string) (inspection, error) {
+// InspectFile reads src's metadata, probes the embedded JPEG headers, and
+// returns a complete Inspection handle. It is the single inspection an item
+// needs; pass the handle to Inspection.Export.
+func InspectFile(ctx context.Context, src string) (*Inspection, error) {
 	if err := ctx.Err(); err != nil {
-		return inspection{}, err
+		return nil, err
 	}
 	src, err := absolutePath(src)
 	if err != nil {
-		return inspection{}, err
+		return nil, err
 	}
 	bin, err := exiftoolPath()
 	if err != nil {
-		return inspection{}, err
+		return nil, err
 	}
 	doc, err := readExifDoc(ctx, bin, src, inspectSelectors)
 	if err != nil {
-		return inspection{}, err
+		return nil, err
 	}
 	insp, err := parseInspection(doc)
 	if err != nil {
-		return inspection{}, err
+		return nil, err
 	}
 	for i := range insp.candidates {
 		insp.candidates[i].probe(ctx, src)
 	}
 	if err := ctx.Err(); err != nil {
-		return inspection{}, err
+		return nil, err
 	}
 	insp.info.choosePreview(insp.candidates)
-	return insp, nil
+	insp.source = src
+	if st, err := os.Stat(src); err == nil {
+		insp.size, insp.modTime, insp.identity = st.Size(), st.ModTime(), true
+	}
+	return &insp, nil
 }
 
 // readExifDoc asks ExifTool for specific tags as JSON.
@@ -134,8 +152,8 @@ func parseExifDoc(raw []byte) (exifDoc, error) {
 // parseInspection converts an ExifTool document into RawDrop's view of the
 // file. Camera dimensions prefer IFD0, the camera's rendered image, over the
 // raw sensor area (IFD3) and thumbnails (IFD2/IFD1).
-func parseInspection(doc exifDoc) (inspection, error) {
-	var insp inspection
+func parseInspection(doc exifDoc) (Inspection, error) {
+	var insp Inspection
 	if w, _, ok := intTag(doc, "ImageWidth", "IFD0"); ok {
 		insp.info.Width = w
 	}

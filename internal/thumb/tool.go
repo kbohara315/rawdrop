@@ -1,7 +1,6 @@
 package thumb
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,13 +9,13 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"rawdrop/internal/exiftool"
 )
 
 const (
 	// maxToolOutput bounds how much one exiftool extraction may buffer.
 	maxToolOutput = 64 << 20
-	// maxToolError bounds the stderr kept for error messages.
-	maxToolError = 8 << 10
 	// defaultToolTimeout bounds one exiftool run when ctx has no deadline.
 	defaultToolTimeout = 30 * time.Second
 )
@@ -53,13 +52,14 @@ func orientationExiftool(ctx context.Context, source string) (int, error) {
 }
 
 // runExiftool runs exiftool with bounded stdout and stderr and a timeout
-// derived from ctx. RAWDROP_EXIFTOOL overrides the binary so tests and
-// packaged installs can point at a helper.
+// derived from ctx, through the shared internal/exiftool runner.
+// RAWDROP_EXIFTOOL overrides the binary so tests and packaged installs can
+// point at a helper.
 func runExiftool(ctx context.Context, limit int, args ...string) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	bin := os.Getenv("RAWDROP_EXIFTOOL")
+	bin := os.Getenv(exiftool.EnvExifTool)
 	if bin == "" {
 		bin = "exiftool"
 	}
@@ -69,59 +69,22 @@ func runExiftool(ctx context.Context, limit int, args ...string) ([]byte, error)
 	}
 	defer cancel()
 
-	cmd := exec.CommandContext(toolCtx, bin, args...)
-	var stdout, stderr limitedBuffer
-	stdout.limit = limit
-	stderr.limit = maxToolError
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		if toolCtx.Err() != nil {
-			return nil, fmt.Errorf("thumb: exiftool: %w", toolCtx.Err())
-		}
-		var exit *exec.ExitError
-		if errors.As(err, &exit) {
-			message := strings.TrimSpace(stderr.String())
-			if message == "" {
-				message = err.Error()
-			}
-			return nil, fmt.Errorf("thumb: exiftool: %s", message)
-		}
-		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("thumb: exiftool not found (%s); install exiftool or set RAWDROP_EXIFTOOL", bin)
-		}
-		return nil, fmt.Errorf("thumb: run exiftool: %w", err)
+	out, err := exiftool.New(bin).Capture(toolCtx, args, int64(limit))
+	if err == nil {
+		return out, nil
 	}
-	if stdout.truncated {
-		return nil, fmt.Errorf("thumb: exiftool output exceeded %d bytes", limit)
+	if toolCtx.Err() != nil {
+		return nil, fmt.Errorf("thumb: exiftool: %w", toolCtx.Err())
 	}
-	return stdout.Bytes(), nil
-}
-
-// limitedBuffer collects at most limit bytes and discards the rest, so a
-// misbehaving tool cannot fill memory. Write always reports success so the
-// child keeps draining instead of blocking on a full pipe.
-type limitedBuffer struct {
-	buf       bytes.Buffer
-	limit     int
-	truncated bool
-}
-
-func (b *limitedBuffer) Write(p []byte) (int, error) {
-	if room := b.limit - b.buf.Len(); room > 0 {
-		if len(p) <= room {
-			b.buf.Write(p)
-		} else {
-			b.buf.Write(p[:room])
-			b.truncated = true
-		}
-	} else if len(p) > 0 {
-		b.truncated = true
+	if errors.Is(err, exiftool.ErrOutputLimit) {
+		return nil, fmt.Errorf("thumb: %s", err)
 	}
-	return len(p), nil
+	var exit *exec.ExitError
+	if errors.As(err, &exit) {
+		return nil, fmt.Errorf("thumb: %s", err)
+	}
+	if errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("thumb: exiftool not found (%s); install exiftool or set %s", bin, exiftool.EnvExifTool)
+	}
+	return nil, fmt.Errorf("thumb: run exiftool: %w", err)
 }
-
-func (b *limitedBuffer) Bytes() []byte { return b.buf.Bytes() }
-
-func (b *limitedBuffer) String() string { return b.buf.String() }

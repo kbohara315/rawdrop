@@ -294,11 +294,13 @@ rawdrop/
     FORMAT_SUPPORT.md      # recognized / exportable / verified camera matrix
     TESTING.md             # Ubuntu manual acceptance checklist
   internal/
-    app/                   # native UI, export orchestration, workers, snapshots
+    app/                   # native UI, export pool, orchestration, snapshots
+    exiftool/              # shared helper discovery and bounded execution
+    exporter/              # one-photo transaction shared by app and CLI
     fsutil/                # no-replace commit, unique names, sync helpers
     journal/               # versioned JSON journal and single-instance lock
     model/                 # job, item, settings, status and RAW extension types
-    raw/                   # ExifTool inspection/extraction, verification, rotation
+    raw/                   # tag interpretation, extraction, verification, rotation
     scan/                  # recursive traversal, dedupe, output naming
     thumb/                 # bounded, orientation-aware grid thumbnails
   IMPLEMENTATION_PLAN.md   # original design and milestones

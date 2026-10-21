@@ -637,6 +637,61 @@ Manual check:
 Automated coverage: `TestProgressHelpers`, `TestRunningStage`, and the
 `TestEndToEndDropExportResume` assertions on the real view.
 
+### Shared helper runner, one inspection, and the export pool
+
+The helper runner, the inspect-once transaction, and the export pool each have
+targeted tests that do not need a window:
+
+```sh
+GOTOOLCHAIN=go1.27.1 go test ./internal/exiftool/ ./internal/exporter/ ./internal/raw/ ./internal/app/
+```
+
+`internal/exiftool` covers binary discovery: the `RAWDROP_EXIFTOOL`/env
+override wins when executable, a missing override is rejected with the
+variable named, and a normal `PATH` lookup is used otherwise. It also covers
+the runner seam: streamed stdout, capped capture that fails with
+`ErrOutputLimit` (and whose message names the limit), a value exactly at the
+limit, a bounded prefix read, a command failure that surfaces the helper's
+stderr, and context cancellation that reports `context.Canceled`.
+
+`internal/raw` covers the `Inspection` handle: `Info()` is a value copy, and
+`checkSource` refuses to use candidate offsets once the source's size or
+mtime changed (`ErrSourceChanged`). The app and exporter tests below prove a
+photo is inspected exactly once even though inspect and export are separate
+steps.
+
+`internal/exporter` covers the shared transaction end to end: a verified commit
+that inspects each source once (`TestExportCommitsVerifiedOutput`), a
+no-full-resolution-JPEG failure that stays discoverable with
+`errors.Is(err, raw.ErrNoFullJPEG)` (`TestExportReportsNoFullJPEG`), a canceled
+export that leaves no temp file (`TestExportCancellation`), a pre-existing
+output that is never overwritten (`TestExportAvoidsOverwritingExistingOutput`),
+and many exports racing for the same planned name that all commit distinct
+files (`TestExportConcurrentCollisions`).
+
+`internal/app` exercises the pool without a display, seeding a job directly and
+pointing `RAWDROP_EXIFTOOL` at a fake helper:
+
+- `TestExportPoolProcessesEachItemOnce` runs a whole batch and checks every
+  photo is inspected exactly once, has its own output, leaves its source
+  byte-identical, and leaves no `.rawdrop-*` temp file.
+- `TestExportPoolPausesNewReservations` proves Pause stops new reservations
+  while in-flight photos finish, then Resume completes the batch.
+- `TestExportPoolCancelKeepsCompletedOutputs` proves Cancel keeps every
+  committed output and cancels only the in-flight photo.
+- `TestExportPoolAvoidsDuplicateOutputNames` proves concurrent commits add
+  suffixes instead of replacing a sentinel.
+
+The real-view `TestEndToEndDropExportResume` covers the same paths through the
+actual drop zone and buttons, and asserts one output per photo after a
+pause/resume and a cancel/relaunch/resume.
+
+The concurrency bound itself (`exportWorkers = 3`) is a safety limit, not a
+performance result. These tests prove correctness under concurrency — no
+duplicate work, no lost or overwritten output — not that three workers is
+faster than a sequential run, and definitely not that a small-file result
+generalizes to a large batch.
+
 ### Per-format verification
 
 A format is not verified until a representative real sample passes the full

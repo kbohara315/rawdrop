@@ -35,8 +35,12 @@ rawdrop/
 ├── scripts/acceptance.sh      copy-only end-to-end check on real photos
 └── internal/
     ├── app/
-    │   ├── app.go             state, scanning entry, export loop, journal use
+    │   ├── app.go             state, scanning entry, export worker pool, journal
     │   └── view.go            native view, snapshots, actions
+    ├── exiftool/
+    │   └── exiftool.go        shared helper runner: discovery, bounded execution
+    ├── exporter/
+    │   └── exporter.go        one-photo transaction shared by app and CLI
     ├── fsutil/
     │   └── fsutil.go          CommitNew, UniquePath, CopyFile, SyncDir
     ├── journal/
@@ -44,39 +48,53 @@ rawdrop/
     │   └── lock_*.go          single-instance lock
     ├── model/
     │   └── model.go           Job, Item, Settings, Status, RAW extensions
-    ├── raw/                   ExifTool adapter, extraction, rotation, verify
+    ├── raw/                   tag interpretation, extraction, rotation, verify
     ├── scan/
     │   └── scan.go            traversal, dedupe, output name planning
     └── thumb/
         ├── thumb.go           bounded upright thumbnails for the grid
         ├── exif.go            JPEG EXIF orientation reader
-        └── tool.go            bounded ExifTool runner
+        └── tool.go            bounded thumbnail runner over internal/exiftool
 ```
+
+`internal/exiftool` is the one place that knows how to find and run a helper
+binary: discovery (honoring `RAWDROP_EXIFTOOL`), streamed extraction, capped
+capture, and prefix reads. It knows nothing about RAW formats or ExifTool's
+tags. `raw` and `thumb` interpret tags and bytes; `raw` keeps jpegtran
+discovery and rotation because those are specific to lossless rotation.
+
+`internal/exporter` is the shared one-photo transaction: inspect once through
+`raw.InspectFile`, extract, apply the metadata policy, verify, and commit into
+the destination with a no-replace link and a final hash. It imports neither
+MyGo nor the job/journal model, so both the desktop app and the headless CLI
+use the same code without either owning the other.
 
 Dependency direction:
 
 ```text
 main                              cmd/rawdrop-cli
-  └── app ──┬── model                 ├── scan ── model
-            ├── scan ────── model     ├── raw
-            ├── raw                   ├── fsutil
-            ├── thumb                 └── model
+  └── app ──┬── model                 └── exporter ──┬── raw ── exiftool
+            ├── scan ────── model                    └── fsutil
+            ├── exporter ─── raw, fsutil
+            ├── raw ─── exiftool
+            ├── thumb ─── exiftool
             ├── journal ─── model, fsutil
             └── fsutil
 ```
 
-`model`, `scan`, `raw`, `thumb`, `journal`, and `fsutil` do not import MyGo.
-Only `internal/app` does. This keeps the processing core testable without a
-window and leaves a path to other desktop frontends.
+`model`, `scan`, `raw`, `thumb`, `exiftool`, `exporter`, `journal`, and
+`fsutil` do not import MyGo. Only `internal/app` does. This keeps the
+processing core testable without a window and leaves a path to other desktop
+frontends.
 
 ### Headless CLI
 
-`cmd/rawdrop-cli` is a second caller of the core. It uses `scan.Collect`,
-`raw.Inspect`, `raw.Export`, and `fsutil.CommitNew` but has no MyGo window and
-no journal. It processes inputs sequentially, applies the same no-replace
-commit, and is useful for scripts and acceptance runs. It does not resume an
-interrupted batch. `scripts/acceptance.sh` drives this CLI against copies of
-real photos and checks hashes, dimensions, and orientation.
+`cmd/rawdrop-cli` is a second caller of the core. It uses `scan.Collect` and
+`exporter.Export`, the same one-photo transaction the app uses, but has no
+MyGo window and no journal. It processes inputs sequentially, applies the same
+no-replace commit, and is useful for scripts and acceptance runs. It does not
+resume an interrupted batch. `scripts/acceptance.sh` drives this CLI against
+copies of real photos and checks hashes, dimensions, and orientation.
 
 ## End-to-end flow
 
@@ -106,18 +124,19 @@ real photos and checks hashes, dimensions, and orientation.
               │                                                  │
               ▼                                                  ▼
    ┌─────────────────────┐                          ┌────────────────────────┐
-   │ thumb workers (4)   │                          │ app.exportLoop (1)      │
-   │ exiftool + decode   │                          │ sequential item export  │
-   │ 320 px, in memory   │                          │ pause/cancel aware      │
+   │ thumb workers (4)   │                          │ export workers (3)      │
+   │ exiftool + decode   │                          │ exporter.Export per     │
+   │ 320 px, in memory   │                          │ photo; pause/cancel     │
    └──────────┬──────────┘                          └───────────┬────────────┘
               │ Window.Update                                   │
               ▼                                                 ▼
    ┌─────────────────────┐                          ┌────────────────────────┐
-   │ native photo grid   │                          │ raw.Inspect            │
-   └─────────────────────┘                          │ raw.Export             │
-                                                    │ verify                 │
-                                                    │ fsutil.CommitNew       │
-                                                    │ SHA-256 + journal      │
+   │ native photo grid   │                          │ exporter.Export        │
+   └─────────────────────┘                          │  inspect once          │
+                                                    │  extract + metadata    │
+                                                    │  verify                │
+                                                    │  CommitNew + SHA-256   │
+                                                    │ journal (app only)     │
                                                     └───────────┬────────────┘
                                                                 ▼
                                                     ┌────────────────────────┐
@@ -163,7 +182,10 @@ journal's SHA-256 is for the **output**, not the source.
 
 ## 2. Per-item pipeline
 
-The export loop processes one item at a time.
+A bounded pool of export workers runs the same one-photo transaction
+(`internal/exporter`) for independent photos; see section 7 for the pool's
+concurrency and pause/cancel behavior. Each item proceeds through these
+stages:
 
 ```text
 queued
@@ -173,6 +195,7 @@ queued
   │        ├─ no full-resolution embedded JPEG ──▶ skipped
   │        ▼
   ├─▶ extracting   extract embedded JPEG to a temp file in the destination
+  │        │       (metadata policy applied to the temp file here)
   │        │
   │        ├─ orientation needed ──▶ rotating
   │        │                          jpegtran DCT transform when possible
@@ -189,9 +212,21 @@ Any active state may become failed. A canceled context produces canceled.
 A missing/full-size-preview condition produces skipped, not failed.
 ```
 
+The exporter inspects the source exactly once. `raw.InspectFile` returns an
+`Inspection` handle that keeps the metadata **and** the embedded-JPEG
+candidates, and the same handle performs the extraction. There is no separate
+second ExifTool read for Inspect and Export. Before extraction the handle
+re-stats the source and refuses to use candidate byte offsets if the file's
+size or modification time changed, so a source replaced between inspect and
+extract fails (or is re-inspected by the caller) instead of extracting from a
+stale offset.
+
+`raw.Export` and `raw.Inspect` remain as thin compatibility wrappers over this
+handle for callers that do not need to share an inspection.
+
 ### Inspection
 
-`raw.Inspect` invokes ExifTool locally and reads:
+`raw.InspectFile` invokes ExifTool locally and reads:
 
 - the camera's full image dimensions;
 - the embedded JPEG dimensions and orientation;
@@ -257,37 +292,36 @@ The final write is deliberately not a normal `rename` over the destination.
 no-overwrite contract.
 
 ```text
-export_one(item):
-    # 1. prepare a temporary file on the same filesystem as the destination
+export_one(item):                          # internal/exporter.Export
+    # 1. inspect the source exactly once; the handle also extracts
+    insp = raw.InspectFile(source)
+
+    # 2. prepare a temporary file on the same filesystem as the destination
     temp = create_unique_temp(dest_dir, ".rawdrop-*.jpg")
     remove(temp)                          # the exporter requires a new path
     defer remove(temp)                    # graceful failure/cancel cleanup
 
-    # 2. extract and transform into temp
-    raw.Export(source, temp, options)
-
-    # 3. verify temp before it is visible under a final name
-    verify_jpeg(temp, expected_dimensions)
+    # 3. extract and apply the metadata policy into temp; verify before commit
+    insp.Export(temp, options)            # verify_jpeg happens inside here
 
     # 4. choose a name, then commit with an atomic no-replace operation
     name = planned_output_name or stem + ".jpg"
-    dest = fsutil.UniquePath(dest_dir, name)   # planning aid only
-    fsutil.CommitNew(temp, dest):
-        if lstat(dest) exists: return EEXIST
-        os.Link(temp, dest)               # atomic; refuses to replace
-        os.Remove(temp)
-    on EEXIST:
-        dest = fsutil.UniquePath(dest_dir, name)  # try the next suffix
-        retry CommitNew once
+    for attempt in 1 .. max_name_attempts:
+        dest = fsutil.UniquePath(dest_dir, name)   # planning aid only
+        fsutil.CommitNew(temp, dest):
+            if lstat(dest) exists: return EEXIST
+            os.Link(temp, dest)               # atomic; refuses to replace
+            os.Remove(temp)
+        on EEXIST: continue                   # a concurrent writer took the name
+        on success or other error: break
 
-    # 5. make the directory entry durable
+    # 5. make the directory entry durable and the file normally readable
+    chmod(dest, 0644)
     fsutil.SyncDir(dest_dir)
 
-    # 6. hash and record the committed result
+    # 6. hash the committed file; the app records status=done in the journal
     hash = sha256(dest)
-    journal(item.status = done,
-            item.output_path = dest,
-            item.output_sha256 = hash)
+    return Result{output_path, hash, dimensions, orientation, warning, ...}
 ```
 
 Invariants:
@@ -297,9 +331,10 @@ Invariants:
 - **Verification happens before the final name appears.** A failed extraction
   or verification never creates a visible `.jpg`.
 - **The hard link is the authority.** `UniquePath` is only a race-reducing
-  suggestion. `os.Link` fails with `EEXIST` if another process created the
-  name after the check. The app retries with a new suffix rather than
-  replacing anything.
+  suggestion. `os.Link` fails with `EEXIST` if another writer — a process, or
+  one of the pool's own workers — created the name after the check. The
+  exporter retries with the next suffix (bounded) rather than replacing
+  anything.
 - **The file is flushed and closed before its final name appears.** The
   extracted JPEG is fsynced, all metadata/rotation helpers close the temp
   file, and the destination directory is synced after the link.
@@ -376,7 +411,7 @@ never a modified original or an overwritten output.
 
 - `empty`: no job.
 - `ready`: a plan exists, including a loaded previous job.
-- `running`: an export loop is active. `paused` is an orthogonal flag.
+- `running`: an export pool is active. `paused` is an orthogonal flag.
 - `results`: the current batch reached a terminal outcome and shows counts,
   **Retry failed**, **Open folder**, and **New batch**.
 
@@ -411,13 +446,14 @@ queued ─▶ inspecting ─▶ extracting ─▶ rotating ─▶ verifying ─�
 | `canceled` | Stopped by the user or window close | Yes |
 
 Only `done`, `skipped`, `failed`, and `canceled` are terminal. Pause stops
-scheduling new items but lets the active item finish; it does not mark the
-item canceled. Cancel cancels the context, terminates a running helper, keeps
-every committed file, and marks unfinished items canceled.
+scheduling new items but lets in-flight items finish; it does not mark them
+canceled. Cancel cancels the context, terminates running helpers, keeps every
+committed file, and marks unfinished items canceled.
 
-`verifying` is part of the model's vocabulary, but the current exporter
-validates the JPEG inside `raw.Export` before returning. The UI may therefore
-move from `rotating` directly to `done` without persisting a separate
+`verifying` is part of the model's vocabulary, but the exporter validates the
+JPEG inside `Inspection.Export` before committing. The exporter reports only
+three progress stages — `inspecting`, `extracting`, and `rotating` — so the UI
+may move from `rotating` directly to `done` without persisting a separate
 `verifying` update.
 
 `done` is revalidated on load: the output must exist, not be a directory, and
@@ -471,7 +507,7 @@ current temp with a deferred cleanup.
 | --- | --- | --- |
 | Scan | One call per add-paths action | Recursive walk, 10-minute context |
 | Thumbnails | 4 workers | One bounded queue; 320 px max edge, JPEG q80, memory only |
-| Export | 1 sequential worker | Keeps memory and disk contention bounded; pause at item boundary |
+| Export | 3 workers | One shared queue; each photo reserved atomically; pause at item boundary |
 | Journal | Serialized by `App.mu` | Single writer; atomic file replacement |
 | ExifTool | Child process per request | Bounded stdout/stderr and per-request timeout |
 | jpegtran | Child process per rotation | `-perfect`; no crop or re-encode fallback |
@@ -494,12 +530,29 @@ large folder can delay the next frame. Moving the scan behind a goroutine is a
 contained change because `scan.Collect` already takes a context and returns a
 plain plan.
 
-The export loop is intentionally single-threaded. Each item is independent,
-but processing one at a time makes pause/cancel, journal ordering, memory use,
-and output collision handling easy to reason about. Pause sets a flag; the
-loop checks it before selecting the next item. Resume wakes the loop. Cancel
-cancels the shared context and any running helper process; the current item
-becomes canceled and completed files stay.
+The export pool runs at most `exportWorkers` (3) photos at once. Three is an
+arbitrary safety bound that overlaps the I/O and process time of independent
+photos while keeping ExifTool child processes, memory, and disk contention
+bounded — not a measured optimum, and not a throughput claim. A run-through of
+a small file set is not evidence that the bound generalizes to a large batch;
+larger batches still serialize through the same disk and helper processes.
+
+Each worker claims the next `queued` item by marking it `inspecting` under
+`App.mu`, so two workers can never reserve the same photo. A failed or
+canceled item is requeued once by `StartExport` before the pool starts,
+rather than being reselected inside the loop, so a repeatedly failing item
+cannot spin forever within one run. The journal is saved under `App.mu` at
+each reservation, stage change, and terminal outcome.
+
+Pause sets a flag and does not disturb work already reserved: a worker about
+to reserve a new item waits on `pauseWait` instead, so in-flight photos finish
+while no new ones start. Resume closes `pauseWait` (waking every waiting
+worker) and installs a fresh channel for the next pause. Cancel cancels the
+shared context and any running helper process, and also wakes workers waiting
+on `pauseWait`; every committed output is kept and only unfinished items
+become canceled. The run finalizes — leaving the running phase and saving the
+final state — only after every worker has stopped, so a late worker cannot
+race the final journal write.
 
 `runID` invalidates stale work. Starting a new batch increments it. A worker
 that finishes after a reset checks `runID` before publishing state, so an old

@@ -11,27 +11,49 @@ import (
 	"strings"
 )
 
-// Export writes a complete, verified JPEG for src to tmpPath. tmpPath must
-// not exist; Export fails rather than replacing anything. On success the
-// caller owns tmpPath and commits it to its final name; on any failure
-// Export removes it. src is only ever read.
+// Export inspects src and writes a complete, verified JPEG for it to tmpPath.
+// tmpPath must not exist; Export fails rather than replacing anything. On
+// success the caller owns tmpPath and commits it to its final name; on any
+// failure Export removes it. src is only ever read.
 //
-// Export extracts the best embedded JPEG tag (PreviewImage, then JpgFromRaw,
-// then OtherImage), rejects candidates that are not at least 90% of the
-// camera's usable displayed size, strips location metadata unless
-// opts.PreserveLocation is set, and rotates the JPEG losslessly when
-// opts.CorrectOrientation asks for it and the pixels allow it. When there is
-// no full-resolution embedded JPEG it returns an error wrapping
-// ErrNoFullJPEG.
+// Export is a convenience wrapper around InspectFile and Inspection.Export.
+// Callers that have already inspected a file should reuse the Inspection
+// handle and avoid a second ExifTool read.
+//
+// It extracts the best embedded JPEG tag (PreviewImage, then JpgFromRaw, then
+// OtherImage), rejects candidates that are not at least 90% of the camera's
+// usable displayed size, strips location metadata unless opts.PreserveLocation
+// is set, and rotates the JPEG losslessly when opts.CorrectOrientation asks for
+// it and the pixels allow it. When there is no full-resolution embedded JPEG it
+// returns an error wrapping ErrNoFullJPEG.
 func Export(ctx context.Context, src, tmpPath string, opts Options) (Result, error) {
-	if err := ctx.Err(); err != nil {
-		return Result{}, err
-	}
-	src, err := absolutePath(src)
+	insp, err := InspectFile(ctx, src)
 	if err != nil {
 		return Result{}, err
 	}
-	tmpPath, err = absolutePath(tmpPath)
+	return insp.Export(ctx, tmpPath, opts)
+}
+
+// Info returns the summary of the inspected file. The result is a value copy,
+// so callers cannot mutate the handle through it.
+func (in *Inspection) Info() Info { return in.info }
+
+// Export writes a complete, verified JPEG for the inspected source to tmpPath,
+// using the candidates already gathered by InspectFile. It has the same
+// contract as the package-level Export.
+func (in *Inspection) Export(ctx context.Context, tmpPath string, opts Options) (Result, error) {
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
+	src := in.source
+	if src == "" {
+		return Result{}, errors.New("raw: inspection has no source path")
+	}
+	// Refuse stale candidate offsets if the source changed after inspection.
+	if err := in.checkSource(); err != nil {
+		return Result{}, err
+	}
+	tmpPath, err := absolutePath(tmpPath)
 	if err != nil {
 		return Result{}, err
 	}
@@ -46,11 +68,7 @@ func Export(ctx context.Context, src, tmpPath string, opts Options) (Result, err
 		return Result{}, err
 	}
 
-	insp, err := inspectFile(ctx, src)
-	if err != nil {
-		return Result{}, err
-	}
-	info := insp.info
+	info := in.info
 
 	// Reserve the temp name with O_EXCL so Export can never touch an existing
 	// file. The deferred cleanup removes it unless the export completes.
@@ -74,7 +92,7 @@ func Export(ctx context.Context, src, tmpPath string, opts Options) (Result, err
 		width, height int
 		reasons       []string
 	)
-	for _, c := range insp.candidates {
+	for _, c := range in.candidates {
 		if err := extractCandidate(ctx, src, f, c); err != nil {
 			if ctx.Err() != nil {
 				// A canceled extraction must surface as context.Canceled
@@ -142,6 +160,23 @@ func Export(ctx context.Context, src, tmpPath string, opts Options) (Result, err
 		Warning:         warning,
 		MetadataCleaned: cleaned,
 	}, nil
+}
+
+// checkSource fails when the source changed after inspection, so Export never
+// uses stale candidate offsets. When the size and modification time are
+// unchanged the offsets are still valid.
+func (in *Inspection) checkSource() error {
+	if !in.identity {
+		return nil
+	}
+	st, err := os.Stat(in.source)
+	if err != nil {
+		return fmt.Errorf("raw: re-stat source: %w", err)
+	}
+	if st.Size() != in.size || !st.ModTime().Equal(in.modTime) {
+		return fmt.Errorf("%w: %s", ErrSourceChanged, filepath.Base(in.source))
+	}
+	return nil
 }
 
 // extractCandidate streams one embedded JPEG candidate into dst, replacing

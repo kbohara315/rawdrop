@@ -22,11 +22,10 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
-	"rawdrop/internal/fsutil"
+	"rawdrop/internal/exporter"
 	"rawdrop/internal/model"
 	"rawdrop/internal/raw"
 	"rawdrop/internal/scan"
@@ -99,12 +98,10 @@ func run() int {
 			fmt.Fprintln(os.Stderr, "rawdrop-cli: interrupted")
 			break
 		}
-		name := item.OutputName
-		if name == "" {
-			name = strings.TrimSuffix(item.Name, filepath.Ext(item.Name)) + ".jpg"
-		}
 		start := time.Now()
-		status, warning := exportOne(ctx, dir, item.Source, name, raw.Options{
+		status, warning := exportOne(ctx, item.Source, exporter.Options{
+			OutputDir:          dir,
+			OutputName:         item.OutputName,
 			CorrectOrientation: !*noRotate,
 			PreserveLocation:   *keepGPS,
 		})
@@ -132,51 +129,18 @@ func run() int {
 	return 0
 }
 
-// exportOne mirrors the app's per-item pipeline: inspect, export to a
-// temporary file, then commit the file without ever replacing an existing
-// output.
-func exportOne(ctx context.Context, dir, source, name string, opts raw.Options) (model.Status, string) {
-	info, err := raw.Inspect(ctx, source)
-	if err != nil {
-		if errors.Is(err, raw.ErrNoFullJPEG) {
-			fmt.Fprintf(os.Stderr, "  skipped %s: %v\n", filepath.Base(source), err)
-			return model.StatusSkipped, ""
-		}
-		fmt.Fprintf(os.Stderr, "  failed %s: %v\n", filepath.Base(source), err)
-		return model.StatusFailed, ""
+// exportOne runs the shared per-photo exporter: inspect once, extract, verify,
+// and commit without ever replacing an existing output. It processes items one
+// at a time; the CLI stays sequential by default.
+func exportOne(ctx context.Context, source string, opts exporter.Options) (model.Status, string) {
+	result, err := exporter.Export(ctx, source, opts)
+	if err == nil {
+		return model.StatusDone, result.Warning
 	}
-	_ = info
-
-	temp, err := os.CreateTemp(dir, ".rawdrop-*.jpg")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "  failed %s: %v\n", filepath.Base(source), err)
-		return model.StatusFailed, ""
+	if errors.Is(err, raw.ErrNoFullJPEG) {
+		fmt.Fprintf(os.Stderr, "  skipped %s: %v\n", filepath.Base(source), err)
+		return model.StatusSkipped, ""
 	}
-	tempPath := temp.Name()
-	temp.Close()
-	os.Remove(tempPath)
-	defer os.Remove(tempPath)
-
-	result, err := raw.Export(ctx, source, tempPath, opts)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "  failed %s: %v\n", filepath.Base(source), err)
-		return model.StatusFailed, ""
-	}
-	dest := fsutil.UniquePath(dir, name)
-	if err := fsutil.CommitNew(tempPath, dest); err != nil {
-		if errors.Is(err, os.ErrExist) {
-			dest = fsutil.UniquePath(dir, name)
-			err = fsutil.CommitNew(tempPath, dest)
-		}
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "  failed %s: %v\n", filepath.Base(source), err)
-			return model.StatusFailed, ""
-		}
-	}
-	_ = fsutil.SyncDir(dir)
-	// Temporary files are created with 0600; a finished export should be a
-	// normal, readable photo.
-	_ = os.Chmod(dest, 0o644)
-	_ = result
-	return model.StatusDone, result.Warning
+	fmt.Fprintf(os.Stderr, "  failed %s: %v\n", filepath.Base(source), err)
+	return model.StatusFailed, ""
 }
