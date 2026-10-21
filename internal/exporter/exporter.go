@@ -103,13 +103,21 @@ const maxNameAttempts = 64
 // export, so a caller that also needs Info should read it from Progress rather
 // than calling raw.Inspect again.
 func Export(ctx context.Context, source string, opts Options) (Result, error) {
-	return export(ctx, source, opts, finishTemp)
+	return export(ctx, source, opts, finishTemp, realExportRaw)
 }
 
-// export is Export with the pre-commit step injected. Tests supply a failing
-// precommit to prove that content/permission/hash failures happen before the
-// no-replace link and therefore leave nothing visible.
-func export(ctx context.Context, source string, opts Options, precommit func(string) (string, error)) (Result, error) {
+// realExportRaw is the production raw export call. Tests wrap it to simulate
+// another process claiming the reserved temp path.
+func realExportRaw(ctx context.Context, insp *raw.Inspection, tempPath string, opts raw.Options) (raw.Result, error) {
+	return insp.Export(ctx, tempPath, opts)
+}
+
+// export is Export with the pre-commit step and the raw export call injected.
+// Tests supply a failing precommit to prove that content/permission/hash
+// failures happen before the no-replace link and therefore leave nothing
+// visible, and a wrapping exportRaw to prove a foreign file at the reserved
+// temp path is never removed.
+func export(ctx context.Context, source string, opts Options, precommit func(string) (string, error), exportRaw func(context.Context, *raw.Inspection, string, raw.Options) (raw.Result, error)) (Result, error) {
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
@@ -141,15 +149,24 @@ func export(ctx context.Context, source string, opts Options, precommit func(str
 	}
 	// Reserve a temp name in the destination directory so the final hard link
 	// cannot cross filesystems. raw.Export requires a path that does not exist
-	// yet, so the created file is removed before the export writes it.
+	// yet, so close the created file and remove the name; raw then claims it
+	// with O_EXCL.
 	temp, err := os.CreateTemp(dir, ".rawdrop-*.jpg")
 	if err != nil {
 		return Result{}, fmt.Errorf("exporter: create temp file: %w", err)
 	}
 	tempPath := temp.Name()
-	temp.Close()
-	os.Remove(tempPath)
-	defer os.Remove(tempPath)
+	if err := temp.Close(); err != nil {
+		// The name is still known to be ours, so removing it is safe.
+		_ = os.Remove(tempPath)
+		return Result{}, fmt.Errorf("exporter: close temp file: %w", err)
+	}
+	// The reservation is ours right now. If its name cannot be cleared, fail
+	// before raw export instead of handing over a path with ambiguous
+	// ownership.
+	if err := os.Remove(tempPath); err != nil {
+		return Result{}, fmt.Errorf("exporter: clear temp path %s: %w", tempPath, err)
+	}
 
 	rawOpts := raw.Options{
 		CorrectOrientation: opts.CorrectOrientation,
@@ -168,10 +185,24 @@ func export(ctx context.Context, source string, opts Options, precommit func(str
 		}
 	}
 
-	res, err := insp.Export(ctx, tempPath, rawOpts)
+	res, err := exportRaw(ctx, insp, tempPath, rawOpts)
 	if err != nil {
+		// raw.Inspection.Export removes its own partial output on failure. Do
+		// not remove tempPath here: after we cleared our reservation another
+		// process may have created a file at that name, and raw's O_EXCL
+		// refusal means it is not ours.
 		return Result{}, err
 	}
+	// raw export created tempPath and owns what it wrote. Only now is the path
+	// known to be this transaction's file, so arm cleanup. On a successful
+	// commit fsutil.CommitNew removes temp; this deferred remove is then a
+	// no-op. Remember the inode so cleanup never deletes a file another
+	// process puts at the same name later.
+	owner, err := os.Stat(tempPath)
+	if err != nil {
+		return Result{}, fmt.Errorf("exporter: stat exported temp file: %w", err)
+	}
+	defer removeOwnedFile(tempPath, owner)
 
 	// Do every fallible content operation before the file becomes visible:
 	// flush it, make it a normal readable photo, and hash it. After the
@@ -201,6 +232,17 @@ func export(ctx context.Context, source string, opts Options, precommit func(str
 		MetadataCleaned: res.MetadataCleaned,
 		SHA256:          hash,
 	}, nil
+}
+
+// removeOwnedFile removes path only when it still refers to owner. A deferred
+// cleanup must not delete a foreign file that another process put at the same
+// name after this transaction finished with it.
+func removeOwnedFile(path string, owner os.FileInfo) {
+	current, err := os.Stat(path)
+	if err != nil || !os.SameFile(owner, current) {
+		return
+	}
+	_ = os.Remove(path)
 }
 
 // finishTemp performs the last fallible work on a completed temp file before

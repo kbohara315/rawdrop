@@ -342,7 +342,7 @@ func TestExportPrecommitFailureLeavesNoOutput(t *testing.T) {
 	injected := errors.New("injected pre-commit failure")
 	_, err := export(context.Background(), src, Options{OutputDir: outDir}, func(string) (string, error) {
 		return "", injected
-	})
+	}, realExportRaw)
 	if !errors.Is(err, injected) {
 		t.Fatalf("export() error = %v, want the injected pre-commit failure", err)
 	}
@@ -354,6 +354,57 @@ func TestExportPrecommitFailureLeavesNoOutput(t *testing.T) {
 		t.Errorf("outDir has %d entries after a pre-commit failure, want 0", len(entries))
 	}
 	assertNoTemps(t, outDir)
+}
+
+// TestExportDoesNotRemoveForeignTempPath simulates another process creating a
+// file at the reserved temp name after the exporter cleared its own
+// reservation but before raw export claims it with O_EXCL. Raw export must
+// refuse the path, and the exporter must leave the foreign file untouched:
+// cleanup is armed only after a successful raw export.
+func TestExportDoesNotRemoveForeignTempPath(t *testing.T) {
+	jpeg := encodeJPEG(t, 640, 480)
+	srcDir := t.TempDir()
+	outDir := t.TempDir()
+	jpegPath := filepath.Join(srcDir, "jpeg.bin")
+	if err := os.WriteFile(jpegPath, jpeg, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := writeFakeExifTool(t, inspectionJSON(640, 480, len(jpeg)), "    cat '"+jpegPath+"'\n", "")
+	t.Setenv(exiftool.EnvExifTool, bin)
+	src := writeSource(t, srcDir, "a.CR2", jpeg)
+
+	const foreign = "not this transaction's file"
+	var reserved string
+	_, err := export(context.Background(), src, Options{OutputDir: outDir}, finishTemp,
+		func(ctx context.Context, insp *raw.Inspection, tempPath string, rawOpts raw.Options) (raw.Result, error) {
+			reserved = tempPath
+			// The exporter has cleared its own reservation. Another process
+			// claims the name before raw export's O_EXCL create.
+			if err := os.WriteFile(tempPath, []byte(foreign), 0o644); err != nil {
+				t.Fatalf("create foreign temp file: %v", err)
+			}
+			return realExportRaw(ctx, insp, tempPath, rawOpts)
+		})
+	if err == nil {
+		t.Fatal("export() succeeded despite a foreign file at the temp path")
+	}
+	if reserved == "" {
+		t.Fatal("export() never called the raw export hook")
+	}
+	got, readErr := os.ReadFile(reserved)
+	if readErr != nil {
+		t.Fatalf("foreign file at the temp path was removed: %v", readErr)
+	}
+	if string(got) != foreign {
+		t.Errorf("foreign file content = %q, want %q", got, foreign)
+	}
+	entries, readErr := os.ReadDir(outDir)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(reserved) {
+		t.Errorf("outDir entries = %v, want only the foreign temp file %q", entries, filepath.Base(reserved))
+	}
 }
 
 // TestExportReportsNoRotationWhenNotNeeded checks the progress stages for an
@@ -380,6 +431,40 @@ func TestExportReportsNoRotationWhenNotNeeded(t *testing.T) {
 	}
 	if want := []Stage{StageInspect, StageExtract}; !slices.Equal(stages, want) {
 		t.Errorf("stages = %v, want %v", stages, want)
+	}
+}
+
+// TestRemoveOwnedFileOnlyRemovesTheOwner checks the deferred cleanup's
+// ownership guard: the same inode is removed, while a replacement at the same
+// name is left alone.
+func TestRemoveOwnedFileOnlyRemovesTheOwner(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "temp.jpg")
+	if err := os.WriteFile(path, []byte("ours"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("theirs"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	removeOwnedFile(path, owner)
+	if got, err := os.ReadFile(path); err != nil || string(got) != "theirs" {
+		t.Fatalf("replacement file = %q, %v; want it untouched", got, err)
+	}
+
+	current, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	removeOwnedFile(path, current)
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("owned temp file still exists: %v", err)
 	}
 }
 

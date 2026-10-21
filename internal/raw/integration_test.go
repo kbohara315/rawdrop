@@ -550,6 +550,21 @@ func TestExportRealPortraitWithoutRotation(t *testing.T) {
 	assertFileUnchanged(t, src, before)
 }
 
+// TestInspectFileCanceledBeforeToolDiscovery proves a pre-canceled call returns
+// context.Canceled even when the configured ExifTool path does not exist. The
+// context must be honored before binary discovery, so a missing tool cannot
+// mask the cancellation.
+func TestInspectFileCanceledBeforeToolDiscovery(t *testing.T) {
+	t.Setenv(envExifTool, filepath.Join(t.TempDir(), "missing-exiftool"))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := InspectFile(ctx, filepath.Join(t.TempDir(), "photo.CR2"))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("InspectFile() error = %v, want context.Canceled", err)
+	}
+}
+
 // TestInspectCancellation checks that canceling the context stops a running
 // helper and surfaces as context.Canceled.
 func TestInspectCancellation(t *testing.T) {

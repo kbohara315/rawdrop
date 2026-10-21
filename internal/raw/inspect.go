@@ -96,6 +96,11 @@ type exifDoc map[string]any
 // returns a complete Inspection handle. It is the single inspection an item
 // needs; pass the handle to Inspection.Export.
 func InspectFile(ctx context.Context, src string) (*Inspection, error) {
+	// Honor cancellation before tool discovery: a pre-canceled call must be
+	// context.Canceled even when ExifTool is unavailable.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	bin, err := exiftoolPath()
 	if err != nil {
 		return nil, err

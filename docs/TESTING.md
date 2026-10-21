@@ -670,7 +670,10 @@ mutates the file while the inspection query is running,
 export, and `TestInspectionRejectsChangeDuringExtraction` mutates it while the
 JPEG is being streamed; all must return `ErrSourceChanged` without leaving a
 temp file. `checkSource` also refuses a source, via `os.SameFile` plus
-size/mtime, once it has changed.
+size/mtime, once it has changed. `TestInspectFileCanceledBeforeToolDiscovery`
+proves a pre-canceled call returns `context.Canceled` even when
+`RAWDROP_EXIFTOOL` points at a missing binary, so tool discovery cannot mask
+cancellation.
 
 `internal/exporter` covers the shared transaction end to end: a verified commit
 that inspects each source once (`TestExportCommitsVerifiedOutput`), a
@@ -684,6 +687,12 @@ injects a failure in the flush/chmod/hash step that now runs before the
 no-replace link, and asserts the output folder contains neither a visible JPEG
 nor a temp file. `TestExportReportsNoRotationWhenNotNeeded` pins the
 `inspecting` → `extracting` progress sequence for an upright photo.
+`TestExportDoesNotRemoveForeignTempPath` simulates another process claiming
+the reserved temp name after the exporter clears its own reservation and
+before raw export's `O_EXCL` create: the export fails and the foreign file is
+left untouched, because cleanup is armed only after a successful raw export.
+`TestRemoveOwnedFileOnlyRemovesTheOwner` pins the inode guard that keeps the
+deferred cleanup from deleting a later replacement at the same name.
 
 `internal/fsutil` covers the commit primitive directly:
 `TestCommitNewLinksAndRemovesTemp` (content visible, temp cleaned up),
