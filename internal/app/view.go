@@ -222,20 +222,25 @@ func (a *App) sidebar(c *ui.Context, st viewState) {
 			})
 			if st.limitOutputSize {
 				limitMB := st.compressionLimitMB
-				ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-					ui.Text(c, "Maximum size").FontSize(12).TextColor(t.TextMuted)
-					ui.Spacer(c).Grow(1)
-					input := ui.NumberInput(c, &limitMB, 0.5, 20, 0.1).Width(92).Label("Maximum JPEG size in megabytes")
-					if input.Changed() && st.phase != phaseRunning {
+				ui.Column(c).FillWidth().Gap(6).Children(func() {
+					ui.Text(c, "Maximum JPEG size (MB)").FontSize(12).TextColor(t.TextMuted)
+					ui.Row(c).FillWidth().Children(func() {
+						ui.Spacer(c).Grow(1)
+						input := ui.NumberInput(c, &limitMB, 0.5, 20, 0.1).Width(92).Label("Maximum JPEG size in megabytes")
+						if input.Changed() && st.phase != phaseRunning {
+							a.setCompressionLimitMB(limitMB)
+						}
+					})
+					slider := ui.StepSlider(c, &limitMB, 0.5, 20, 0.1).FillWidth().Label("Maximum JPEG size in megabytes")
+					if slider.Changed() && st.phase != phaseRunning {
 						a.setCompressionLimitMB(limitMB)
 					}
-					ui.Text(c, "MB").FontSize(12).TextColor(t.TextMuted)
+					ui.Row(c).FillWidth().Children(func() {
+						ui.Text(c, "0.5 MB").FontSize(10).TextColor(t.TextMuted)
+						ui.Spacer(c).Grow(1)
+						ui.Text(c, "20 MB").FontSize(10).TextColor(t.TextMuted)
+					})
 				})
-				slider := ui.StepSlider(c, &limitMB, 0.5, 20, 0.1).FillWidth().Label("Maximum JPEG size in megabytes")
-				if slider.Changed() && st.phase != phaseRunning {
-					a.setCompressionLimitMB(limitMB)
-				}
-				ui.Text(c, "0.5 MB to 20 MB per photo").FontSize(10).TextColor(t.TextMuted)
 			}
 
 			gps := st.preserveLocation
