@@ -570,9 +570,13 @@ func realCR2() string {
 	if path := os.Getenv("RAWDROP_TEST_CR2"); path != "" {
 		return path
 	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
 	for _, pattern := range []string{
-		"/home/kshitij/Pictures/dashain photos/*.CR2",
-		"/home/kshitij/Pictures/Camera/*.CR2",
+		filepath.Join(home, "Pictures", "dashain photos", "*.CR2"),
+		filepath.Join(home, "Pictures", "Camera", "*.CR2"),
 	} {
 		if matches, _ := filepath.Glob(pattern); len(matches) > 0 {
 			return matches[0]

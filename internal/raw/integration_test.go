@@ -21,13 +21,15 @@ import (
 // Integration tests use the real Canon EOS 80D sample photos when they are
 // available. The folder is read-only for these tests: every output goes to
 // t.TempDir(). Set RAWDROP_TEST_PHOTOS to point at another sample folder.
-const defaultSampleDir = "/home/kshitij/Pictures/dashain photos"
-
 func sampleDir() string {
 	if dir := os.Getenv("RAWDROP_TEST_PHOTOS"); dir != "" {
 		return dir
 	}
-	return defaultSampleDir
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, "Pictures", "dashain photos")
 }
 
 // requireExifTool skips the test when exiftool is unavailable.

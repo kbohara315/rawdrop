@@ -17,7 +17,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SAMPLE_DIR="${1:-/home/kshitij/Pictures/dashain photos}"
+SAMPLE_DIR="${1:-${RAWDROP_TEST_PHOTOS:-$HOME/Pictures/dashain photos}}"
 COUNT="${2:-8}"
 WORK="${RAWDROP_ACCEPTANCE_DIR:-/tmp/opencode/rawdrop-acceptance}"
 GO="${GOTOOLCHAIN:-go1.27.1}"

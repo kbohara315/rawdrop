@@ -33,7 +33,7 @@ func TestSnapshots(t *testing.T) {
 
 	// A real batch, so the grid shows real thumbnails. The sample folder is
 	// this machine's; the test skips elsewhere.
-	sample := "/home/kshitij/Pictures/dashain photos"
+	sample := sampleDir()
 	files := []string{"IMG_3128.CR2", "IMG_3129.CR2", "IMG_3144.CR2", "IMG_3145.CR2"}
 	paths := make([]string, 0, len(files))
 	for _, name := range files {

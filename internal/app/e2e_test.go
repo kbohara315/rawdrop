@@ -14,6 +14,20 @@ import (
 	"rawdrop/internal/raw"
 )
 
+// sampleDir returns the folder of real sample photos on this machine, or ""
+// when it cannot be determined. Set RAWDROP_TEST_PHOTOS to point at another
+// folder. Tests skip when the folder or a photo in it is missing.
+func sampleDir() string {
+	if dir := os.Getenv("RAWDROP_TEST_PHOTOS"); dir != "" {
+		return dir
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, "Pictures", "dashain photos")
+}
+
 // TestEndToEndDropExportResume drives the path a person takes, without a
 // display: the MyGo headless tester renders the real view, so the folder is
 // dropped on the actual drop zone and Export is the actual button. The
@@ -25,7 +39,7 @@ func TestEndToEndDropExportResume(t *testing.T) {
 	if err := raw.CheckTools(); err != nil {
 		t.Skipf("exiftool or jpegtran is not available: %v", err)
 	}
-	sample := "/home/kshitij/Pictures/dashain photos"
+	sample := sampleDir()
 	// Two sideways photos (orientation 8) and two already-upright ones, so
 	// the check covers both a lossless rotation and a byte-equal copy.
 	want := map[string][2]int{
