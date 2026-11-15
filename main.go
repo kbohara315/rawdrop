@@ -13,7 +13,7 @@ func main() {
 	a := app.New()
 	mygo.App.WhenReady(func() {
 		win := mygo.NewWindow(mygo.WindowOptions{
-			Title:     "RawDrop — RAW to full-resolution JPEG",
+			Title:     "RawDrop — Local photo export",
 			Width:     1180,
 			Height:    780,
 			MinWidth:  880,

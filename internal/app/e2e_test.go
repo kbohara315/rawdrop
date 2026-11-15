@@ -65,7 +65,7 @@ func TestEndToEndDropExportResume(t *testing.T) {
 
 	tester := ui.NewTester(a.View, 1400, 900)
 	tester.Frame()
-	zone, ok := tester.Find("Drop RAW photos here")
+	zone, ok := tester.Find("Drop photos here")
 	if !ok {
 		t.Fatal("the welcome screen did not render its drop zone")
 	}
@@ -76,7 +76,7 @@ func TestEndToEndDropExportResume(t *testing.T) {
 
 	a.SetOutputDir(outDir)
 	tester.Frame()
-	if err := tester.Click("Export 4 photo(s)"); err != nil {
+	if err := tester.Click("Export 4 photos"); err != nil {
 		t.Fatalf("could not press Export: %v", err)
 	}
 

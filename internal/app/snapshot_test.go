@@ -44,7 +44,7 @@ func TestSnapshots(t *testing.T) {
 		paths = append(paths, p)
 	}
 
-	zone, ok := tester.Find("Drop RAW photos here")
+	zone, ok := tester.Find("Drop photos here")
 	if !ok {
 		t.Fatal("the welcome screen did not render its drop zone")
 	}
@@ -82,7 +82,7 @@ func TestSnapshots(t *testing.T) {
 	tester.SetDark(false)
 	tester.Frame()
 
-	if err := tester.Click("Export 4 photo(s)"); err != nil {
+	if err := tester.Click("Export 4 photos"); err != nil {
 		t.Fatalf("could not press Export: %v", err)
 	}
 	tester.Frame()

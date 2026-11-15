@@ -66,6 +66,7 @@ type App struct {
 	runID   int
 
 	scanning     bool
+	confirmClear bool
 	pendingPaths []string
 	closed       bool
 
@@ -249,6 +250,7 @@ func (a *App) AddPaths(paths []string) {
 		a.toast("Wait for the current export to finish")
 		return
 	}
+	a.confirmClear = false
 	if a.scanning {
 		// A drop during a scan is remembered and handled after it.
 		a.pendingPaths = append(a.pendingPaths, paths...)
@@ -310,7 +312,11 @@ func (a *App) AddPaths(paths []string) {
 	if len(res.Unsupported) > 0 {
 		extra = fmt.Sprintf(" • %d unsupported item(s) ignored", len(res.Unsupported))
 	}
-	a.status = fmt.Sprintf("%d photo(s) ready%s", total, extra)
+	noun := "photos"
+	if total == 1 {
+		noun = "photo"
+	}
+	a.status = fmt.Sprintf("%d %s ready%s", total, noun, extra)
 	if total == 0 {
 		a.banner = "No supported photos were found. Add RAW files or JPEG photos."
 	} else {
@@ -454,6 +460,7 @@ func (a *App) ChooseOutput() {
 // StartExport validates settings and begins a resumable export.
 func (a *App) StartExport() {
 	a.mu.Lock()
+	a.confirmClear = false
 	if a.running {
 		a.mu.Unlock()
 		return
@@ -820,6 +827,7 @@ func (a *App) Cancel() {
 // RetryFailed queues failed items again and starts the export.
 func (a *App) RetryFailed() {
 	a.mu.Lock()
+	a.confirmClear = false
 	if a.job == nil || a.running {
 		a.mu.Unlock()
 		return
@@ -856,11 +864,13 @@ func (a *App) ClearExported() {
 		return
 	}
 	if len(remaining) == 0 {
+		a.confirmClear = false
 		a.mu.Unlock()
 		a.NewBatch()
 		a.toast(fmt.Sprintf("Cleared %d exported photo(s) from the list", removed))
 		return
 	}
+	a.confirmClear = false
 
 	inputs := make([]string, 0, len(remaining))
 	for _, item := range remaining {
@@ -882,45 +892,52 @@ func (a *App) ClearExported() {
 	} else {
 		a.phase = phaseReady
 	}
-	a.status = fmt.Sprintf("Cleared %d exported photo(s) from the list", removed)
+	clearNotice := fmt.Sprintf("Cleared %d exported photo(s) from the list", removed)
+	a.status = clearNotice
 	a.banner = ""
 	items := append([]*model.Item(nil), updated.Items...)
 	runID := a.runID
+	showClearToast := updated.Finished()
 	a.saveLocked()
 	a.mu.Unlock()
 	a.redraw()
+	if showClearToast {
+		a.toast(clearNotice)
+	}
 	go a.startThumbnails(items, runID)
 }
 
-// confirmClearBatch clears the in-app batch and its resume journal after the
-// user confirms. Source photos and exported files are never deleted.
-func (a *App) confirmClearBatch() {
+// requestClearBatch begins an inline confirmation. Files on disk are never
+// removed by clearing the batch.
+func (a *App) requestClearBatch() {
 	a.mu.Lock()
-	if a.job == nil || a.running || a.scanning || a.win == nil {
+	if a.job == nil || a.running || a.scanning {
 		a.mu.Unlock()
 		return
 	}
-	win := a.win
-	count := len(a.job.Items)
+	a.confirmClear = true
 	a.mu.Unlock()
+	a.redraw()
+}
 
-	result, err := mygo.Dialog.Message(mygo.MessageOptions{
-		Parent:        win,
-		Type:          mygo.MessageQuestion,
-		Title:         "Clear photo list?",
-		Message:       fmt.Sprintf("Remove all %d photos from this RawDrop batch?", count),
-		Detail:        "This clears the saved batch and resume state. Source photos and exported JPEGs on disk will not be deleted.",
-		Buttons:       []string{"Cancel", "Clear list"},
-		DefaultButton: 0,
-		CancelButton:  0,
-	})
-	if err != nil {
-		a.toast("Could not open the clear confirmation: " + err.Error())
+func (a *App) cancelClearBatch() {
+	a.mu.Lock()
+	a.confirmClear = false
+	a.mu.Unlock()
+	a.redraw()
+}
+
+// confirmClearBatch clears the app list and resume journal after the inline
+// confirmation. Source photos and exported files remain on disk.
+func (a *App) confirmClearBatch() {
+	a.mu.Lock()
+	if !a.confirmClear || a.job == nil || a.running || a.scanning {
+		a.confirmClear = false
+		a.mu.Unlock()
 		return
 	}
-	if result.Button != 1 {
-		return
-	}
+	a.confirmClear = false
+	a.mu.Unlock()
 	a.NewBatch()
 }
 
@@ -939,6 +956,7 @@ func (a *App) NewBatch() {
 	a.phase = phaseEmpty
 	a.status = ""
 	a.banner = ""
+	a.confirmClear = false
 	a.selected = -1
 	a.grid = ui.GridState{}
 	a.bitmaps = make(map[string]*ui.Bitmap)
