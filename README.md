@@ -338,3 +338,13 @@ UI framework, which keeps the core testable without a window.
 RawDrop invokes ExifTool and, when needed, `jpegtran`. It does not vendor or
 redistribute either tool. Install them through Ubuntu's package manager. Their
 licenses and notices apply to those tools.
+
+## License
+
+RawDrop is released under the [MIT License](LICENSE).
+
+Copyright (c) 2026 Kshitij Bohara.
+
+The MIT license covers this repository's source code and documentation. It
+does not extend to ExifTool, `jpegtran`, or any other third-party tool you
+install separately.
