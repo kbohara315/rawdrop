@@ -105,6 +105,37 @@ func inspectFile(ctx context.Context, src string) (inspection, error) {
 	return insp, nil
 }
 
+// inspectJPEG reads dimensions from the JPEG frame and camera metadata from
+// ExifTool. JPEG inputs do not need embedded-image candidate discovery.
+func inspectJPEG(ctx context.Context, src string) (Info, error) {
+	if err := ctx.Err(); err != nil {
+		return Info{}, err
+	}
+	src, err := absolutePath(src)
+	if err != nil {
+		return Info{}, err
+	}
+	w, h, err := validateJPEGFile(src)
+	if err != nil {
+		return Info{}, fmt.Errorf("raw: inspect JPEG: %w", err)
+	}
+	bin, err := exiftoolPath()
+	if err != nil {
+		return Info{}, err
+	}
+	doc, err := readExifDoc(ctx, bin, src, []string{"-Orientation", "-Make", "-Model"})
+	if err != nil {
+		return Info{}, err
+	}
+	info := Info{Width: w, Height: h, Orientation: 1, HasPreview: true, PreviewTag: "JPEG", PreviewWidth: w, PreviewHeight: h}
+	if orientation, _, ok := intTag(doc, "Orientation", "IFD0"); ok && orientation >= 1 && orientation <= 8 {
+		info.Orientation = orientation
+	}
+	info.Make = stringTag(doc, "Make")
+	info.Model = stringTag(doc, "Model")
+	return info, nil
+}
+
 // readExifDoc asks ExifTool for specific tags as JSON.
 func readExifDoc(ctx context.Context, bin, path string, selectors []string) (exifDoc, error) {
 	args := append([]string{"-j", "-n", "-G1"}, selectors...)

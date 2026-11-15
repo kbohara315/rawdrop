@@ -1,4 +1,4 @@
-// Package scan turns dropped paths into a stable, deduplicated list of RAW
+// Package scan turns dropped paths into a stable, deduplicated list of photo
 // photos for a job. It never opens photo contents: eligibility is decided by
 // extension and the exporter still validates each file's metadata.
 package scan
@@ -19,11 +19,11 @@ import (
 
 // Result is the outcome of one scan.
 type Result struct {
-	// Items are the RAW photos to process, in display order. Every item is
+	// Items are the supported photos to process, in display order. Every item is
 	// queued and has a stable ID and a planned output name.
 	Items []*model.Item
 	// Unsupported are explicitly dropped files whose extension is not a
-	// known RAW type. Files with other extensions found inside dropped
+	// known photo type. Files with other extensions found inside dropped
 	// folders are ignored silently.
 	Unsupported []string
 	// SkippedDirs are dropped or walked paths that were excluded or could
@@ -40,11 +40,11 @@ func ItemID(source string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// Collect walks inputs and returns one item per unique RAW photo.
+// Collect walks inputs and returns one item per unique supported photo.
 //
-// File inputs are accepted only when their extension is a known RAW type;
+// File inputs are accepted only when their extension is a known RAW or JPEG type;
 // other dropped files are recorded in Unsupported. Directory inputs are
-// walked recursively: non-RAW files inside them are ignored silently and
+// walked recursively: non-photo files inside them are ignored silently and
 // unreadable directories are recorded in SkippedDirs without failing the
 // scan. Directory symlinks are never followed. The output directory and
 // everything inside it are excluded even when they are inputs or do not
@@ -123,7 +123,7 @@ func Collect(ctx context.Context, inputs []string, outputDir string) (Result, er
 			}
 		case info.Mode().IsRegular():
 			usable++
-			if model.IsRawName(abs) {
+			if model.IsPhotoName(abs) {
 				c.addItem(abs, info)
 			} else {
 				c.addUnsupported(abs)
@@ -227,7 +227,7 @@ func (c *collector) walk(ctx context.Context, dir, out string) error {
 			}
 			continue
 		}
-		if !model.IsRawName(entry.Name()) {
+		if !model.IsPhotoName(entry.Name()) {
 			continue
 		}
 		info, err := entry.Info()

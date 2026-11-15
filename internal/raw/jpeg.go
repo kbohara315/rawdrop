@@ -7,11 +7,22 @@ import (
 	"image/jpeg"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 )
 
 // jpegHeaderLimit bounds how much of an embedded JPEG is read when only its
 // header is needed.
 const jpegHeaderLimit = 1 << 20
+
+func isJPEGPath(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".jpg", ".jpeg":
+		return true
+	default:
+		return false
+	}
+}
 
 // jpegDimensions reads a JPEG's pixel dimensions from its header without
 // decoding pixels. It fails for anything that is not a decodable JPEG or has

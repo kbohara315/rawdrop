@@ -17,8 +17,11 @@ type viewState struct {
 	outputDir          string
 	correctOrientation bool
 	preserveLocation   bool
+	limitOutputSize    bool
+	compressionLimitMB float64
 	running            bool
 	paused             bool
+	scanning           bool
 	items              []model.Item
 	counts             model.Counts
 }
@@ -34,8 +37,11 @@ func (a *App) snapshot() viewState {
 		outputDir:          a.outputDir,
 		correctOrientation: a.correctOrientation,
 		preserveLocation:   a.preserveLocation,
+		limitOutputSize:    a.limitOutputSize,
+		compressionLimitMB: float64(a.maxOutputBytes) / 1_000_000,
 		running:            a.running,
 		paused:             a.paused,
+		scanning:           a.scanning,
 	}
 	a.flash = ""
 	if a.job != nil {
@@ -92,7 +98,7 @@ func (a *App) header(c *ui.Context, st viewState) {
 			}
 			ui.Column(c).Gap(2).Children(func() {
 				ui.Text(c, "RawDrop").FontSize(20).Bold()
-				ui.Text(c, "RAW photos to full-resolution JPEG • offline").FontSize(12).TextColor(t.TextMuted)
+				ui.Text(c, "RAW and JPEG photos • offline").FontSize(12).TextColor(t.TextMuted)
 			})
 			ui.Spacer(c).Grow(1)
 			if st.counts.Total > 0 {
@@ -104,6 +110,11 @@ func (a *App) header(c *ui.Context, st viewState) {
 				}
 				if ui.Button(c, "Add folder").Clicked() {
 					a.ChooseFolder()
+				}
+			}
+			if st.counts.Total > 0 && !st.running && !st.scanning {
+				if ui.Button(c, "Clear list").Clicked() {
+					go a.confirmClearBatch()
 				}
 			}
 		})
@@ -132,7 +143,7 @@ func (a *App) welcome(c *ui.Context, st viewState) {
 					a.ChooseFolder()
 				}
 			})
-			ui.Text(c, "Canon CR2 and other RAW formats with a full-resolution embedded JPEG").
+			ui.Text(c, "Camera RAW files and regular .JPG/.JPEG photos are supported").
 				FontSize(12).TextColor(t.TextMuted).TextAlign(ui.Center)
 		})
 
@@ -145,7 +156,7 @@ func (a *App) welcome(c *ui.Context, st viewState) {
 
 		ui.Row(c).Gap(26).Children(func() {
 			a.promise(c, "Originals stay untouched", "Read-only source access")
-			a.promise(c, "No extra compression", "Camera JPEG bytes are preserved")
+			a.promise(c, "Lossless by default", "JPEG image data is preserved")
 			a.promise(c, "100% local", "No uploads, accounts or telemetry")
 		})
 	})
@@ -170,6 +181,10 @@ func (a *App) sidebar(c *ui.Context, st viewState) {
 				path = "Choose a folder for the JPEGs"
 			}
 			ui.Text(c, path).FontSize(13).SingleLine().Ellipsis("…")
+			if st.limitOutputSize {
+				folder := sizeLimitSubdirectory(int64(st.compressionLimitMB * 1_000_000))
+				ui.Text(c, "Compressed copies go in /"+folder).FontSize(10).TextColor(t.TextMuted)
+			}
 			if st.phase != phaseRunning && ui.Button(c, "Change folder").Clicked() {
 				a.ChooseOutput()
 			}
@@ -179,9 +194,9 @@ func (a *App) sidebar(c *ui.Context, st viewState) {
 			ui.Text(c, "Quality").FontSize(12).Bold().TextColor(t.TextMuted)
 			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 				ui.Box(c).Size(8, 8).Radius(4).Background(t.Success)
-				ui.Text(c, "Full-resolution camera JPEG").FontSize(13)
+				ui.Text(c, "Lossless JPEG optimization").FontSize(13)
 			})
-			ui.Text(c, "The embedded JPEG is copied, not re-encoded. JPEG is compressed by the camera; RawDrop adds no further compression loss.").
+			ui.Text(c, "Orientation and size optimization preserve image data by default.").
 				FontSize(11).TextColor(t.TextMuted)
 
 			correct := st.correctOrientation
@@ -194,6 +209,34 @@ func (a *App) sidebar(c *ui.Context, st viewState) {
 					ui.Text(c, "Lossless rotation when possible").FontSize(10).TextColor(t.TextMuted)
 				})
 			})
+
+			limitOutput := st.limitOutputSize
+			ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
+				if ui.Switch(c, &limitOutput).Changed() && st.phase != phaseRunning {
+					a.setLimitOutputSize(limitOutput)
+				}
+				ui.Column(c).Gap(1).Children(func() {
+					ui.Text(c, "Limit JPEG file size").FontSize(13)
+					ui.Text(c, "Lossy recompression, full resolution").FontSize(10).TextColor(t.TextMuted)
+				})
+			})
+			if st.limitOutputSize {
+				limitMB := st.compressionLimitMB
+				ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+					ui.Text(c, "Maximum size").FontSize(12).TextColor(t.TextMuted)
+					ui.Spacer(c).Grow(1)
+					input := ui.NumberInput(c, &limitMB, 0.5, 20, 0.1).Width(92).Label("Maximum JPEG size in megabytes")
+					if input.Changed() && st.phase != phaseRunning {
+						a.setCompressionLimitMB(limitMB)
+					}
+					ui.Text(c, "MB").FontSize(12).TextColor(t.TextMuted)
+				})
+				slider := ui.StepSlider(c, &limitMB, 0.5, 20, 0.1).FillWidth().Label("Maximum JPEG size in megabytes")
+				if slider.Changed() && st.phase != phaseRunning {
+					a.setCompressionLimitMB(limitMB)
+				}
+				ui.Text(c, "0.5 MB to 20 MB per photo").FontSize(10).TextColor(t.TextMuted)
+			}
 
 			gps := st.preserveLocation
 			ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
@@ -263,7 +306,13 @@ func (a *App) main(c *ui.Context, st viewState) {
 			})
 		}
 		if st.status != "" && st.phase != phaseRunning {
-			ui.Text(c, st.status).FontSize(13).TextColor(t.TextMuted)
+			ui.Row(c).FillWidth().Gap(12).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, st.status).FontSize(13).TextColor(t.TextMuted).Grow(1)
+				if st.counts.Done > 0 && !st.running && !st.scanning &&
+					ui.Button(c, fmt.Sprintf("Clear exported (%d)", st.counts.Done)).Clicked() {
+					a.ClearExported()
+				}
+			})
 		}
 		if st.phase == phaseResults {
 			a.results(c, st)
@@ -292,7 +341,7 @@ func (a *App) results(c *ui.Context, st viewState) {
 			a.OpenOutput()
 		}
 		if ui.Button(c, "New batch").Clicked() {
-			a.NewBatch()
+			go a.confirmClearBatch()
 		}
 	})
 }
@@ -301,7 +350,7 @@ func (a *App) photoGrid(c *ui.Context, st viewState) {
 	t := c.Theme()
 	if len(st.items) == 0 {
 		ui.Column(c).Fill().Center().Children(func() {
-			ui.Text(c, "No supported RAW photos").FontSize(16).TextColor(t.TextMuted)
+			ui.Text(c, "No supported photos").FontSize(16).TextColor(t.TextMuted)
 		})
 		return
 	}
@@ -359,6 +408,12 @@ func (a *App) bitmap(item model.Item) *ui.Bitmap {
 func statusLabel(item model.Item) string {
 	switch item.Status {
 	case model.StatusDone:
+		if item.Compressed {
+			if item.Rotated {
+				return "Size limited • upright"
+			}
+			return "Size limited"
+		}
 		if item.Rotated {
 			return "Exported • upright"
 		}
@@ -407,7 +462,7 @@ func (a *App) footer(c *ui.Context, st viewState) {
 	t := c.Theme()
 	ui.Row(c).FillWidth().Padding(24, 8).BorderWidth(1, 0, 0, 0).BorderColor(t.Border).
 		Children(func() {
-			ui.Text(c, "Originals are read-only • ExifTool + lossless JPEG rotation • Everything stays on this computer").
+			ui.Text(c, "Originals are read-only • lossless orientation by default • everything stays on this computer").
 				FontSize(10).TextColor(t.TextMuted)
 			ui.Spacer(c).Grow(1)
 			if st.counts.Total > 0 {
@@ -438,6 +493,29 @@ func (a *App) setPreserveLocation(v bool) {
 	a.preserveLocation = v
 	if a.job != nil {
 		a.job.Settings.PreserveLocation = v
+	}
+	a.mu.Unlock()
+}
+
+func (a *App) setLimitOutputSize(v bool) {
+	a.mu.Lock()
+	a.limitOutputSize = v
+	if a.job != nil {
+		a.job.Settings.LimitOutputSize = v
+	}
+	a.mu.Unlock()
+}
+
+func (a *App) setCompressionLimitMB(v float64) {
+	if v < 0.5 {
+		v = 0.5
+	} else if v > 20 {
+		v = 20
+	}
+	a.mu.Lock()
+	a.maxOutputBytes = int64(v*10+0.5) * 100_000
+	if a.job != nil {
+		a.job.Settings.MaxOutputBytes = a.maxOutputBytes
 	}
 	a.mu.Unlock()
 }

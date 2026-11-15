@@ -3,6 +3,7 @@ package raw
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,6 +17,8 @@ import (
 const (
 	envExifTool = "RAWDROP_EXIFTOOL"
 	envJpegTran = "RAWDROP_JPEGTRAN"
+	envCJPEG    = "RAWDROP_CJPEG"
+	envDJPEG    = "RAWDROP_DJPEG"
 )
 
 // maxStderrBytes bounds how much helper stderr is kept for error messages.
@@ -40,6 +43,22 @@ func lookTool(envName, name string) (string, error) {
 func exiftoolPath() (string, error) { return lookTool(envExifTool, "exiftool") }
 
 func jpegtranPath() (string, error) { return lookTool(envJpegTran, "jpegtran") }
+
+func cjpegPath() (string, error) { return lookTool(envCJPEG, "cjpeg") }
+
+func djpegPath() (string, error) { return lookTool(envDJPEG, "djpeg") }
+
+// CheckCompressionTools verifies the optional tools used for lossy size caps.
+func CheckCompressionTools() error {
+	var errs []error
+	if _, err := cjpegPath(); err != nil {
+		errs = append(errs, err)
+	}
+	if _, err := djpegPath(); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
 
 // cappedBuffer keeps at most max bytes; further writes are dropped but
 // reported as accepted so helper processes never block on stderr.

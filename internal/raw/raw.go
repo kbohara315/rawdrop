@@ -1,18 +1,14 @@
-// Package raw is RawDrop's processing core. It inspects RAW files with
-// ExifTool, extracts the camera's embedded full-resolution JPEG without
-// re-encoding it, removes location metadata unless asked to keep it, and
-// optionally rotates the JPEG physically with a lossless jpegtran DCT
-// transform.
+// Package raw is RawDrop's photo-processing core. It inspects RAW and JPEG
+// files, extracts the camera's embedded full-resolution JPEG from RAW files,
+// applies lossless optimization and orientation correction, and optionally
+// recompresses outputs to a requested size limit.
 //
-// The package shells out to the exiftool and jpegtran helpers. Both are found
-// with exec.LookPath but may be overridden with the RAWDROP_EXIFTOOL and
-// RAWDROP_JPEGTRAN environment variables. External processes always run under
-// the caller's context, so canceling the context stops a running helper and
-// surfaces as context.Canceled.
+// The package shells out to ExifTool, jpegtran, cjpeg, and djpeg as needed.
+// Helpers are found with exec.LookPath and can be overridden with environment
+// variables. External processes run under the caller's context.
 //
 // Source files are opened read-only and are never modified, renamed or
-// deleted. Export streams the embedded JPEG into the caller-provided temporary
-// path and never holds image data in memory.
+// deleted. Export writes to the caller-provided temporary path.
 package raw
 
 import (
@@ -26,7 +22,7 @@ import (
 // why.
 var ErrNoFullJPEG = errors.New("no full-resolution embedded JPEG found")
 
-// Info describes a RAW file, read without extracting its embedded JPEG.
+// Info describes a RAW or JPEG photo.
 type Info struct {
 	// Width and Height are the camera's usable, rendered image dimensions as
 	// reported by EXIF (for example 6000x4000 for a Canon EOS 80D). They are
@@ -63,6 +59,9 @@ type Options struct {
 	// PreserveLocation keeps GPS and other location tags. When false (the
 	// default for a zero Options) location metadata is removed.
 	PreserveLocation bool
+	// MaxOutputBytes optionally enables lossy JPEG recompression. A zero value
+	// keeps the full-quality JPEG after lossless optimization.
+	MaxOutputBytes int64
 }
 
 // Result describes a successful export.
@@ -82,6 +81,13 @@ type Result struct {
 	Warning string
 	// MetadataCleaned is true when location metadata was removed.
 	MetadataCleaned bool
+	// Compressed reports whether lossy recompression was needed to meet the
+	// requested MaxOutputBytes limit.
+	Compressed bool
+	// Quality is the libjpeg quality setting used when Compressed is true.
+	Quality int
+	// SizeBytes is the final encoded JPEG size.
+	SizeBytes int64
 }
 
 // CheckTools returns an error naming every required helper that cannot be
@@ -98,10 +104,12 @@ func CheckTools() error {
 	return errors.Join(errs...)
 }
 
-// Inspect reads a RAW file's metadata without extracting the embedded JPEG.
-// The returned Info reports the camera's usable dimensions, EXIF orientation,
-// make and model, and the best embedded full-resolution JPEG candidate.
+// Inspect reads a RAW or JPEG photo's metadata without extracting embedded
+// image data. For RAW files it also inspects full-resolution JPEG candidates.
 func Inspect(ctx context.Context, src string) (Info, error) {
+	if isJPEGPath(src) {
+		return inspectJPEG(ctx, src)
+	}
 	insp, err := inspectFile(ctx, src)
 	if err != nil {
 		return Info{}, err

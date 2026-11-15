@@ -1,7 +1,7 @@
 # RawDrop architecture
 
-This document describes how RawDrop moves a dropped RAW file to a verified
-JPEG without changing the original. It covers the package layout, the
+This document describes how RawDrop processes a dropped RAW or JPEG photo to
+a verified JPEG without changing the original. It covers the package layout, the
 single-item pipeline, the no-replace write protocol, the job journal, the
 state machine, crash recovery, and the threading rules for MyGo.
 
@@ -9,8 +9,10 @@ state machine, crash recovery, and the threading rules for MyGo.
 
 1. **The original is read-only.** No code path renames, moves, writes, or
    deletes a source file.
-2. **The camera JPEG is copied, not re-encoded.** RawDrop extracts the
-   full-resolution embedded JPEG and never renders the RAW sensor data.
+2. **The default path is lossless.** RAW inputs use the camera's full-size
+   embedded JPEG; JPEG inputs are copied. Huffman optimization and orientation
+   correction preserve the JPEG coefficients. The optional configurable size
+   limit is explicitly lossy and writes into a separate child folder.
 3. **A preview is never a fallback.** The embedded JPEG must match the
    camera's full image dimensions. Otherwise the item is skipped.
 4. **Existing files are never overwritten.** Final commits use an atomic
@@ -135,10 +137,11 @@ folder when none is set.
 
 `scan.Collect` then:
 
-- accepts explicit files only when their extension is a known RAW extension;
+- accepts explicit files only when their extension is a known RAW or JPEG
+  extension;
 - walks explicit folders recursively without following directory symlinks;
-- ignores non-RAW files found during a walk;
-- records explicitly dropped non-RAW files as `Unsupported`;
+- ignores unsupported files found during a walk;
+- records explicitly dropped unsupported files as `Unsupported`;
 - records unreadable directories and excluded output paths in `SkippedDirs`;
 - excludes the output directory and everything beneath it;
 - deduplicates overlapping inputs by cleaned absolute path;
@@ -212,11 +215,10 @@ filesystem, not in the system temp directory. The name starts with
 `.rawdrop-` and ends in `.jpg`. This guarantees the final hard link does not
 cross filesystems.
 
-The embedded JPEG is written to that temporary file. Before verification,
-ExifTool removes GPS and geotag metadata unless **Keep location data** is
-enabled. Other metadata and the color profile already present in the embedded
-JPEG are left in place; RawDrop does not synthesize a new metadata set from the
-RAW file.
+For RAW input, the embedded JPEG is written to the temporary file. For JPEG
+input, the source JPEG is copied there. Before verification, ExifTool removes
+GPS and geotag metadata unless **Keep location data** is enabled. Other
+metadata and the color profile are left in place.
 
 If orientation correction is enabled and the source needs it:
 
@@ -225,10 +227,16 @@ If orientation correction is enabled and the source needs it:
 - the crop-free `-perfect` mode is used when possible;
 - the orientation tag is reset only after the physical rotation succeeds.
 
-If the transform cannot be applied without cropping or re-encoding (including
-when `jpegtran` is unavailable), RawDrop retains the orientation metadata and
-records a warning. It does not silently crop, resize, or encode the image a
-second time.
+When no physical rotation is needed, `jpegtran -optimize` can reduce Huffman
+overhead without changing image coefficients. If a transform cannot be
+applied without cropping (including when `jpegtran` is unavailable), RawDrop
+retains the orientation metadata and records a warning.
+
+When **Limit JPEG file size** is enabled and the lossless output exceeds the
+configured target (0.5–20 MB), `djpeg` and `cjpeg` re-encode the main image at
+descending quality settings until it fits. EXIF, XMP, and ICC metadata are
+copied, dimensions are preserved, and the result is written beneath a folder
+named for the target size.
 
 ### Verification
 
@@ -373,7 +381,9 @@ never a modified original or an overwritten output.
 - `ready`: a plan exists, including a loaded previous job.
 - `running`: an export loop is active. `paused` is an orthogonal flag.
 - `results`: the current batch reached a terminal outcome and shows counts,
-  **Retry failed**, **Open folder**, and **New batch**.
+  **Retry failed**, **Open folder**, and **New batch**. **Clear exported**
+  removes successful entries from the journal while preserving their files;
+  **Clear list** confirms before dropping the full batch and resume state.
 
 A previous job with unfinished items loads into `ready`; a fully finished job
 loads into `results`.
@@ -553,8 +563,9 @@ when shared state changes.
 
 ## 9. Verification and quality boundaries
 
-RawDrop can guarantee **no additional JPEG encoding generation**. It cannot
-make JPEG lossless, and it cannot recover detail the camera did not store.
+In the default mode, RawDrop does not add a JPEG encoding generation. The
+optional size-limit mode does add one and can reduce detail. No mode can
+recover detail the camera did not store.
 
 What the code verifies:
 
@@ -567,17 +578,16 @@ What the code verifies:
 What it deliberately does not do:
 
 - render RAW sensor data;
-- resize or re-encode the JPEG;
+- resize JPEG images;
 - replace a missing full-size JPEG with a preview;
 - crop to make a rotation fit;
 - overwrite a pre-existing output;
 - modify, rename, move, or delete a source.
 
-Color profiles and other tags already inside the embedded JPEG are preserved.
-RawDrop does not copy a separate metadata set from the RAW container. GPS and
+Color profiles and EXIF/XMP tags already inside the JPEG are preserved. GPS and
 geotag tags are removed unless **Keep location data** is enabled. Metadata
-changes do not re-encode the compressed image; a physical orientation change
-uses the lossless DCT transform.
+changes and lossless orientation do not re-encode image coefficients; only the
+explicit size-limit mode does.
 
 ## 10. Known implementation gaps
 
@@ -598,5 +608,5 @@ These are useful to know when reviewing or extending the app:
 - Physical rotation depends on `jpegtran` and on `-perfect` being applicable;
   metadata-only orientation remains the safe fallback.
 - Hard-link commits restrict destinations to filesystems that support links.
-- Only one job is retained; **New batch** clears the journal rather than
-  keeping a history.
+- Only one job is retained; clearing a batch removes its journal rather than
+  keeping a history. Exported and source files remain on disk.

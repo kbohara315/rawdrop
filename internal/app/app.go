@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -50,6 +51,8 @@ type App struct {
 	outputDir          string
 	correctOrientation bool
 	preserveLocation   bool
+	limitOutputSize    bool
+	maxOutputBytes     int64
 
 	phase  phase
 	status string
@@ -83,6 +86,7 @@ func New() *App {
 		bitmaps:            make(map[string]*ui.Bitmap),
 		thumbSize:          make(map[string]int),
 		correctOrientation: true,
+		maxOutputBytes:     model.DefaultMaxOutputBytes,
 		selected:           -1,
 	}
 }
@@ -184,6 +188,24 @@ func (a *App) loadPreviousFrom(dir string) {
 	a.outputDir = job.Settings.OutputDir
 	a.correctOrientation = job.Settings.CorrectOrientation
 	a.preserveLocation = job.Settings.PreserveLocation
+	if job.Settings.MaxOutputBytes > 0 {
+		a.maxOutputBytes = job.Settings.MaxOutputBytes
+	} else {
+		a.maxOutputBytes = model.DefaultMaxOutputBytes
+	}
+	if a.maxOutputBytes < 500_000 {
+		a.maxOutputBytes = 500_000
+	} else if a.maxOutputBytes > 20_000_000 {
+		a.maxOutputBytes = 20_000_000
+	}
+	job.Settings.MaxOutputBytes = a.maxOutputBytes
+	a.limitOutputSize = job.Settings.LimitOutputSize || job.Settings.CompressUnder5MB
+	if job.Settings.CompressUnder5MB && !job.Settings.LimitOutputSize {
+		// Migrate the fixed 5 MB setting written by earlier releases.
+		job.Settings.LimitOutputSize = true
+		job.Settings.MaxOutputBytes = model.DefaultMaxOutputBytes
+	}
+	job.Settings.CompressUnder5MB = false
 	c := job.Count()
 	if job.Finished() {
 		a.phase = phaseResults
@@ -245,7 +267,7 @@ func (a *App) AddPaths(paths []string) {
 		}
 	}()
 	a.phase = phaseReady
-	a.status = "Looking for RAW photos…"
+	a.status = "Looking for photos…"
 	inputs := uniquePaths(append(a.inputs, paths...))
 	if a.outputDir == "" {
 		a.outputDir = defaultOutput(inputs)
@@ -286,11 +308,11 @@ func (a *App) AddPaths(paths []string) {
 	total := len(job.Items)
 	extra := ""
 	if len(res.Unsupported) > 0 {
-		extra = fmt.Sprintf(" • %d non-RAW item(s) ignored", len(res.Unsupported))
+		extra = fmt.Sprintf(" • %d unsupported item(s) ignored", len(res.Unsupported))
 	}
 	a.status = fmt.Sprintf("%d photo(s) ready%s", total, extra)
 	if total == 0 {
-		a.banner = "No supported RAW photos were found. Drop .CR2 files or a folder containing them."
+		a.banner = "No supported photos were found. Add RAW files or JPEG photos."
 	} else {
 		a.banner = ""
 	}
@@ -372,11 +394,11 @@ func (a *App) ChoosePhotos() {
 	go func() {
 		paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
 			Parent:   win,
-			Title:    "Add RAW photos",
+			Title:    "Add photos",
 			Multiple: true,
 			Filters: []mygo.FileFilter{{
-				Name:       "RAW photos",
-				Extensions: []string{"cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "dng", "raf", "rw2", "orf", "pef", "srw", "raw", "rwl", "3fr", "erf", "mef", "mos", "iiq"},
+				Name:       "RAW and JPEG photos",
+				Extensions: []string{"cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "dng", "raf", "rw2", "orf", "pef", "srw", "raw", "rwl", "3fr", "erf", "mef", "mos", "iiq", "jpg", "jpeg"},
 			}},
 		})
 		if err != nil {
@@ -397,7 +419,7 @@ func (a *App) ChooseFolder() {
 	go func() {
 		paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
 			Parent:    win,
-			Title:     "Add a folder of RAW photos",
+			Title:     "Add a folder of photos",
 			Directory: true,
 		})
 		if err != nil {
@@ -438,8 +460,16 @@ func (a *App) StartExport() {
 	}
 	if a.job == nil || len(a.job.Items) == 0 {
 		a.mu.Unlock()
-		a.toast("Add some RAW photos first")
+		a.toast("Add some photos first")
 		return
+	}
+	if a.limitOutputSize {
+		if err := raw.CheckCompressionTools(); err != nil {
+			a.banner = "The JPEG size limit needs cjpeg and djpeg from libjpeg-turbo-progs."
+			a.mu.Unlock()
+			a.redraw()
+			return
+		}
 	}
 	if strings.TrimSpace(a.outputDir) == "" {
 		a.mu.Unlock()
@@ -465,6 +495,8 @@ func (a *App) StartExport() {
 		OutputDir:          a.outputDir,
 		CorrectOrientation: a.correctOrientation,
 		PreserveLocation:   a.preserveLocation,
+		LimitOutputSize:    a.limitOutputSize,
+		MaxOutputBytes:     a.maxOutputBytes,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	a.cancel = cancel
@@ -587,12 +619,20 @@ func (a *App) exportOne(ctx context.Context, runID int, item *model.Item) {
 		CorrectOrientation: a.job.Settings.CorrectOrientation,
 		PreserveLocation:   a.job.Settings.PreserveLocation,
 	}
+	if a.job.Settings.LimitOutputSize {
+		opts.MaxOutputBytes = a.job.Settings.MaxOutputBytes
+		outputDir = filepath.Join(outputDir, sizeLimitSubdirectory(opts.MaxOutputBytes))
+	}
 	source := item.Source
 	outputName := item.OutputName
 	sourceName := item.Name
 	a.mu.Unlock()
 
-	a.setState(runID, item, model.StatusInspecting, "Reading camera metadata…")
+	if model.IsJPEGName(source) {
+		a.setState(runID, item, model.StatusInspecting, "Reading JPEG metadata…")
+	} else {
+		a.setState(runID, item, model.StatusInspecting, "Reading camera metadata…")
+	}
 	info, err := raw.Inspect(ctx, source)
 	if err != nil {
 		a.finishItem(runID, item, err)
@@ -605,7 +645,11 @@ func (a *App) exportOne(ctx context.Context, runID int, item *model.Item) {
 	item.Warning = ""
 	a.mu.Unlock()
 
-	a.setState(runID, item, model.StatusExtracting, "Extracting the camera JPEG…")
+	if model.IsJPEGName(source) {
+		a.setState(runID, item, model.StatusExtracting, "Preparing the JPEG…")
+	} else {
+		a.setState(runID, item, model.StatusExtracting, "Extracting the camera JPEG…")
+	}
 	dir := outputDir
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		a.finishItem(runID, item, fmt.Errorf("create output folder: %w", err))
@@ -675,6 +719,8 @@ func (a *App) exportOne(ctx context.Context, runID int, item *model.Item) {
 	item.Height = result.Height
 	item.Orientation = result.Orientation
 	item.Rotated = result.Rotated
+	item.Compressed = result.Compressed
+	item.Quality = result.Quality
 	item.Warning = result.Warning
 	item.Message = ""
 	item.Thumbnail = nil
@@ -790,11 +836,99 @@ func (a *App) RetryFailed() {
 	a.StartExport()
 }
 
+// ClearExported removes successful entries from the batch journal and list.
+// Exported JPEG files and the original photos are kept on disk.
+func (a *App) ClearExported() {
+	a.mu.Lock()
+	if a.job == nil || a.running || a.scanning {
+		a.mu.Unlock()
+		return
+	}
+	remaining := make([]*model.Item, 0, len(a.job.Items))
+	for _, item := range a.job.Items {
+		if item.Status != model.StatusDone {
+			remaining = append(remaining, item)
+		}
+	}
+	removed := len(a.job.Items) - len(remaining)
+	if removed == 0 {
+		a.mu.Unlock()
+		return
+	}
+	if len(remaining) == 0 {
+		a.mu.Unlock()
+		a.NewBatch()
+		a.toast(fmt.Sprintf("Cleared %d exported photo(s) from the list", removed))
+		return
+	}
+
+	inputs := make([]string, 0, len(remaining))
+	for _, item := range remaining {
+		inputs = append(inputs, item.Source)
+	}
+	previous := a.job
+	updated := model.NewJob(inputs, previous.Settings)
+	updated.Created = previous.Created
+	updated.Items = remaining
+	a.job = updated
+	a.inputs = inputs
+	a.runID++
+	a.selected = -1
+	a.grid = ui.GridState{}
+	a.bitmaps = make(map[string]*ui.Bitmap)
+	a.thumbSize = make(map[string]int)
+	if updated.Finished() {
+		a.phase = phaseResults
+	} else {
+		a.phase = phaseReady
+	}
+	a.status = fmt.Sprintf("Cleared %d exported photo(s) from the list", removed)
+	a.banner = ""
+	items := append([]*model.Item(nil), updated.Items...)
+	runID := a.runID
+	a.saveLocked()
+	a.mu.Unlock()
+	a.redraw()
+	go a.startThumbnails(items, runID)
+}
+
+// confirmClearBatch clears the in-app batch and its resume journal after the
+// user confirms. Source photos and exported files are never deleted.
+func (a *App) confirmClearBatch() {
+	a.mu.Lock()
+	if a.job == nil || a.running || a.scanning || a.win == nil {
+		a.mu.Unlock()
+		return
+	}
+	win := a.win
+	count := len(a.job.Items)
+	a.mu.Unlock()
+
+	result, err := mygo.Dialog.Message(mygo.MessageOptions{
+		Parent:        win,
+		Type:          mygo.MessageQuestion,
+		Title:         "Clear photo list?",
+		Message:       fmt.Sprintf("Remove all %d photos from this RawDrop batch?", count),
+		Detail:        "This clears the saved batch and resume state. Source photos and exported JPEGs on disk will not be deleted.",
+		Buttons:       []string{"Cancel", "Clear list"},
+		DefaultButton: 0,
+		CancelButton:  0,
+	})
+	if err != nil {
+		a.toast("Could not open the clear confirmation: " + err.Error())
+		return
+	}
+	if result.Button != 1 {
+		return
+	}
+	a.NewBatch()
+}
+
 // NewBatch clears the current job. It never deletes exported files or
 // originals; the journal is cleared so the next launch starts fresh.
 func (a *App) NewBatch() {
 	a.mu.Lock()
-	if a.running {
+	if a.running || a.scanning {
 		a.mu.Unlock()
 		return
 	}
@@ -821,6 +955,9 @@ func (a *App) NewBatch() {
 func (a *App) OpenOutput() {
 	a.mu.Lock()
 	dir := a.outputDir
+	if dir != "" && a.limitOutputSize {
+		dir = filepath.Join(dir, sizeLimitSubdirectory(a.maxOutputBytes))
+	}
 	a.mu.Unlock()
 	if dir == "" {
 		return
@@ -838,6 +975,14 @@ func (a *App) OpenFile(path string) {
 	if err := mygo.Shell.OpenPath(path); err != nil {
 		a.toast("Could not open the photo: " + err.Error())
 	}
+}
+
+func sizeLimitSubdirectory(maxBytes int64) string {
+	if maxBytes == model.MaxOutputBytesUnder5MB {
+		return "Under 5 MB"
+	}
+	mb := strconv.FormatFloat(float64(maxBytes)/1_000_000, 'f', -1, 64)
+	return "Up to " + mb + " MB"
 }
 
 func (a *App) saveLocked() {

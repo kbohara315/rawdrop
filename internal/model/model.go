@@ -11,6 +11,13 @@ import (
 	"time"
 )
 
+// DefaultMaxOutputBytes is the decimal 5 MB initial value for the optional
+// lossy output-size setting.
+const DefaultMaxOutputBytes int64 = 5_000_000
+
+// MaxOutputBytesUnder5MB is retained for the CLI's fixed --under-5mb option.
+const MaxOutputBytesUnder5MB int64 = DefaultMaxOutputBytes
+
 // Status is the lifecycle state of one source photo.
 type Status string
 
@@ -62,6 +69,8 @@ type Item struct {
 	Height      int       `json:"height,omitempty"`
 	Orientation int       `json:"orientation,omitempty"`
 	Rotated     bool      `json:"rotated,omitempty"`
+	Compressed  bool      `json:"compressed,omitempty"`
+	Quality     int       `json:"quality,omitempty"`
 	// Thumbnail is a small encoded JPEG for the grid. It is never persisted.
 	Thumbnail []byte `json:"-"`
 }
@@ -75,6 +84,14 @@ type Settings struct {
 	CorrectOrientation bool `json:"correctOrientation"`
 	// PreserveLocation keeps GPS tags. Off by default.
 	PreserveLocation bool `json:"preserveLocation"`
+	// LimitOutputSize enables lossy JPEG recompression to stay within
+	// MaxOutputBytes. It is off by default.
+	LimitOutputSize bool `json:"limitOutputSize,omitempty"`
+	// MaxOutputBytes is the requested per-photo maximum in decimal bytes.
+	MaxOutputBytes int64 `json:"maxOutputBytes,omitempty"`
+	// CompressUnder5MB reads settings written by RawDrop 0.2/0.3. It remains
+	// false for newly written jobs and is migrated to LimitOutputSize on load.
+	CompressUnder5MB bool `json:"compressUnder5MB,omitempty"`
 }
 
 // DefaultSettings returns the safe defaults used for a new job.
@@ -83,6 +100,7 @@ func DefaultSettings(outputDir string) Settings {
 		OutputDir:          outputDir,
 		CorrectOrientation: true,
 		PreserveLocation:   false,
+		MaxOutputBytes:     DefaultMaxOutputBytes,
 	}
 }
 
@@ -168,7 +186,23 @@ var RawExtensions = map[string]bool{
 	".erf": true, ".mef": true, ".mos": true, ".iiq": true,
 }
 
+// JPEGExtensions are already-rendered photos that RawDrop can orient and
+// optimize without treating them as camera RAW containers.
+var JPEGExtensions = map[string]bool{
+	".jpg": true, ".jpeg": true,
+}
+
 // IsRawName reports whether name has a known RAW extension.
 func IsRawName(name string) bool {
 	return RawExtensions[strings.ToLower(filepath.Ext(name))]
+}
+
+// IsJPEGName reports whether name has a JPEG extension.
+func IsJPEGName(name string) bool {
+	return JPEGExtensions[strings.ToLower(filepath.Ext(name))]
+}
+
+// IsPhotoName reports whether name is a supported RAW or JPEG photo.
+func IsPhotoName(name string) bool {
+	return IsRawName(name) || IsJPEGName(name)
 }

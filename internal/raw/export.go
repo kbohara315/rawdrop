@@ -16,14 +16,15 @@ import (
 // caller owns tmpPath and commits it to its final name; on any failure
 // Export removes it. src is only ever read.
 //
-// Export extracts the best embedded JPEG tag (PreviewImage, then JpgFromRaw,
-// then OtherImage), rejects candidates that are not at least 90% of the
-// camera's usable displayed size, strips location metadata unless
-// opts.PreserveLocation is set, and rotates the JPEG losslessly when
-// opts.CorrectOrientation asks for it and the pixels allow it. When there is
-// no full-resolution embedded JPEG it returns an error wrapping
-// ErrNoFullJPEG.
+// Export extracts the best full-resolution embedded JPEG from RAW sources or
+// copies JPEG sources directly. It strips location metadata unless
+// opts.PreserveLocation is set, corrects orientation losslessly when possible,
+// and uses lossless Huffman optimization. A positive MaxOutputBytes enables
+// lossy recompression only when needed to meet that cap.
 func Export(ctx context.Context, src, tmpPath string, opts Options) (Result, error) {
+	if isJPEGPath(src) {
+		return exportJPEG(ctx, src, tmpPath, opts)
+	}
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
@@ -119,6 +120,13 @@ func Export(ctx context.Context, src, tmpPath string, opts Options) (Result, err
 	if err != nil {
 		return Result{}, err
 	}
+	compressed, quality := false, 0
+	if opts.MaxOutputBytes > 0 {
+		quality, compressed, err = compressJPEGToLimit(ctx, tmpPath, opts.MaxOutputBytes)
+		if err != nil {
+			return Result{}, err
+		}
+	}
 
 	final := finalOrientation(info.Orientation, rotated)
 	expW, expH := width, height
@@ -132,6 +140,10 @@ func Export(ctx context.Context, src, tmpPath string, opts Options) (Result, err
 	if err := verifyOutput(ctx, bin, tmpPath, expW, expH, final, !opts.PreserveLocation); err != nil {
 		return Result{}, err
 	}
+	st, err := os.Stat(tmpPath)
+	if err != nil {
+		return Result{}, err
+	}
 
 	keep = true
 	return Result{
@@ -141,6 +153,9 @@ func Export(ctx context.Context, src, tmpPath string, opts Options) (Result, err
 		Rotated:         rotated,
 		Warning:         warning,
 		MetadataCleaned: cleaned,
+		Compressed:      compressed,
+		Quality:         quality,
+		SizeBytes:       st.Size(),
 	}, nil
 }
 
@@ -160,11 +175,10 @@ func extractCandidate(ctx context.Context, src string, dst *os.File, c candidate
 	return runTool(ctx, bin, []string{"-b", "-" + c.selector(), "--", src}, dst)
 }
 
-// applyMetadata performs the metadata stages of an export on the extracted,
-// verified JPEG at path: location removal, optional lossless rotation, and
-// orientation normalisation. It reports whether the pixels were rotated and
-// whether location metadata was cleaned; warning explains a rotation that was
-// requested but could not be applied losslessly.
+// applyMetadata performs location removal, optional lossless rotation,
+// orientation normalization, and lossless Huffman optimization on path. It
+// reports whether the pixels were rotated and whether location metadata was
+// cleaned; warning explains a requested operation that could not be applied.
 func applyMetadata(ctx context.Context, path string, orientation int, opts Options) (rotated, cleaned bool, warning string, err error) {
 	bin, err := exiftoolPath()
 	if err != nil {
@@ -196,7 +210,22 @@ func applyMetadata(ctx context.Context, path string, orientation int, opts Optio
 			return false, cleaned, "", fmt.Errorf("raw: set EXIF orientation: %w", err)
 		}
 	}
+	if !rotated {
+		if err := optimizeLossless(ctx, path); err != nil {
+			if ctx.Err() != nil {
+				return false, cleaned, warning, err
+			}
+			warning = appendWarning(warning, "lossless JPEG size optimization was skipped: "+err.Error())
+		}
+	}
 	return rotated, cleaned, warning, nil
+}
+
+func appendWarning(current, next string) string {
+	if current == "" {
+		return next
+	}
+	return current + "; " + next
 }
 
 // stripLocation removes GPS and geotag metadata, keeping everything else.
@@ -222,9 +251,9 @@ func readOrientation(ctx context.Context, bin, path string) (int, error) {
 
 // rotateLossless rewrites path with jpegtran's lossless DCT transform for the
 // given orientation. The transform is applied only when every edge block can
-// be transformed (-perfect); otherwise the extracted JPEG stays exactly as it
-// was and the caller reports a warning. No crop, trim or re-encode ever
-// happens here.
+// be transformed (-perfect); otherwise the JPEG pixels stay exactly as they
+// were and the caller reports a warning. No crop, trim, or lossy image
+// re-encoding happens here.
 func rotateLossless(ctx context.Context, path string, orientation int) error {
 	transform := jpegTransform(orientation)
 	if transform == nil {
@@ -241,13 +270,36 @@ func rotateLossless(ctx context.Context, path string, orientation int) error {
 	outName := out.Name()
 	out.Close()
 	defer os.Remove(outName)
-	args := append([]string{"-copy", "all", "-perfect"}, transform...)
+	args := append([]string{"-copy", "all", "-optimize", "-perfect"}, transform...)
 	args = append(args, "-outfile", outName, path)
 	if err := runTool(ctx, bin, args, io.Discard); err != nil {
 		return err
 	}
 	if err := os.Rename(outName, path); err != nil {
 		return fmt.Errorf("replace rotated file: %w", err)
+	}
+	return nil
+}
+
+// optimizeLossless rewrites JPEG entropy coding without changing any image
+// coefficients. Metadata markers are copied unchanged.
+func optimizeLossless(ctx context.Context, path string) error {
+	bin, err := jpegtranPath()
+	if err != nil {
+		return err
+	}
+	out, err := os.CreateTemp(filepath.Dir(path), ".rawdrop-optimize-*.jpg")
+	if err != nil {
+		return fmt.Errorf("create optimization temp file: %w", err)
+	}
+	outName := out.Name()
+	out.Close()
+	defer os.Remove(outName)
+	if err := runTool(ctx, bin, []string{"-copy", "all", "-optimize", "-outfile", outName, path}, io.Discard); err != nil {
+		return err
+	}
+	if err := os.Rename(outName, path); err != nil {
+		return fmt.Errorf("replace optimized JPEG: %w", err)
 	}
 	return nil
 }

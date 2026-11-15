@@ -1,4 +1,4 @@
-// Package thumb renders small, upright JPEG previews of RAW files for the
+// Package thumb renders small, upright JPEG previews of RAW and JPEG photos for the
 // photo grid. It extracts an embedded image with exiftool and scales it with
 // golang.org/x/image/draw. Sources are only ever opened read-only.
 package thumb
@@ -11,6 +11,7 @@ import (
 	"image"
 	"image/jpeg"
 	"math"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -38,7 +39,7 @@ const (
 
 var jpegMagic = []byte{0xFF, 0xD8}
 
-// Make returns a small JPEG thumbnail of the RAW file at source. It prefers
+// Make returns a small JPEG thumbnail of the photo at source. It prefers
 // the embedded ThumbnailImage, falls back to a scaled-down PreviewImage when
 // the thumbnail is missing or below 100 px, applies the EXIF orientation,
 // and encodes JPEG at quality 80 with a 320 px long edge. The source is
@@ -52,6 +53,10 @@ func Make(ctx context.Context, source string) ([]byte, error) {
 	}
 
 	img, raw, err := pickEmbedded(ctx, source)
+	if err != nil && isJPEGSource(source) {
+		img, err = decodeJPEGFile(source)
+		raw = nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -70,6 +75,28 @@ func Make(ctx context.Context, source string) ([]byte, error) {
 		orientation = sourceOrientation(ctx, source)
 	}
 	return render(img, orientation)
+}
+
+func isJPEGSource(source string) bool {
+	switch strings.ToLower(filepath.Ext(source)) {
+	case ".jpg", ".jpeg":
+		return true
+	default:
+		return false
+	}
+}
+
+func decodeJPEGFile(source string) (image.Image, error) {
+	f, err := os.Open(source)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	img, err := jpeg.Decode(f)
+	if err != nil {
+		return nil, fmt.Errorf("thumb: decode JPEG: %w", err)
+	}
+	return img, nil
 }
 
 // pickEmbedded selects the best embedded image: the thumbnail when it is

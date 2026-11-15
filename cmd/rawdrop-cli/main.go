@@ -1,6 +1,5 @@
-// Command rawdrop-cli exports full-resolution JPEGs from RAW photos without
-// the desktop interface. It uses exactly the same processing core as the
-// RawDrop app, which makes it useful for scripting and for acceptance tests.
+// Command rawdrop-cli exports JPEGs from RAW or JPEG photos without the
+// desktop interface. It uses the same processing core as the RawDrop app.
 //
 // Usage:
 //
@@ -11,6 +10,7 @@
 //	-o, --output DIR   output directory (required)
 //	--keep-gps         keep GPS tags (default strips them)
 //	--no-rotate        only write EXIF orientation, never rotate pixels
+//	--under-5mb        make lossy, full-resolution copies under 5 MB
 //	--quiet            only print the final summary
 package main
 
@@ -41,6 +41,7 @@ func run() int {
 	outputLong := flag.String("output", "", "output directory (required)")
 	keepGPS := flag.Bool("keep-gps", false, "keep GPS metadata in exported JPEGs")
 	noRotate := flag.Bool("no-rotate", false, "do not physically rotate; write EXIF orientation only")
+	under5MB := flag.Bool("under-5mb", false, "create lossy full-resolution JPEGs under 5 MB")
 	quiet := flag.Bool("quiet", false, "only print the final summary")
 	timeout := flag.Duration("timeout", 0, "overall timeout, for example 10m (0 means none)")
 	flag.Parse()
@@ -66,6 +67,12 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "rawdrop-cli:", err)
 		return 1
 	}
+	if *under5MB {
+		if err := raw.CheckCompressionTools(); err != nil {
+			fmt.Fprintln(os.Stderr, "rawdrop-cli:", err)
+			return 1
+		}
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -81,14 +88,18 @@ func run() int {
 		return 1
 	}
 	if !*quiet {
-		fmt.Printf("found %d RAW photo(s), %d unsupported item(s), %d skipped path(s)\n",
+		fmt.Printf("found %d photo(s), %d unsupported item(s), %d skipped path(s)\n",
 			len(res.Items), len(res.Unsupported), len(res.SkippedDirs))
 	}
 	if len(res.Items) == 0 {
 		fmt.Fprintln(os.Stderr, "rawdrop-cli: nothing to export")
 		return 1
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	outputDir := dir
+	if *under5MB {
+		outputDir = filepath.Join(dir, "Under 5 MB")
+	}
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
 		fmt.Fprintln(os.Stderr, "rawdrop-cli:", err)
 		return 1
 	}
@@ -104,10 +115,14 @@ func run() int {
 			name = strings.TrimSuffix(item.Name, filepath.Ext(item.Name)) + ".jpg"
 		}
 		start := time.Now()
-		status, warning := exportOne(ctx, dir, item.Source, name, raw.Options{
+		opts := raw.Options{
 			CorrectOrientation: !*noRotate,
 			PreserveLocation:   *keepGPS,
-		})
+		}
+		if *under5MB {
+			opts.MaxOutputBytes = model.MaxOutputBytesUnder5MB
+		}
+		status, warning := exportOne(ctx, outputDir, item.Source, name, opts)
 		switch status {
 		case model.StatusDone:
 			done++
@@ -125,7 +140,7 @@ func run() int {
 		}
 	}
 
-	fmt.Printf("exported %d, skipped %d, failed %d into %s\n", done, skipped, failed, dir)
+	fmt.Printf("exported %d, skipped %d, failed %d into %s\n", done, skipped, failed, outputDir)
 	if failed > 0 {
 		return 1
 	}

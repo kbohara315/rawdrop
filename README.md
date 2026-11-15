@@ -2,10 +2,9 @@
 
 <img src="resources/icon.png" width="96" alt="RawDrop app icon">
 
-RawDrop is a local Ubuntu/Linux desktop app for turning RAW photos into
-full-resolution JPEGs. Drop RAW files or a folder, review the thumbnails, and
-export the camera's own embedded JPEGs into a new folder. Originals are only
-ever read.
+RawDrop is a local Ubuntu/Linux desktop app for preparing camera RAW and JPEG
+photos. Drop photos or a folder, review the thumbnails, correct orientation,
+and export JPEGs to a new folder. Originals are only ever read.
 
 The MVP is built and validated with Canon `.CR2` files. Other RAW extensions
 are recognized, but a file is exported only when it contains a
@@ -15,25 +14,33 @@ full-resolution embedded JPEG.
 
 - Accepts dragged files and folders, plus **Add photos** and **Add folder**
   pickers.
+- Accepts camera RAW formats and ordinary `.JPG` / `.JPEG` photos.
 - Scans folders recursively, deduplicates overlapping drops, ignores
-  non-RAW files inside folders, and excludes the output folder.
+  unsupported files inside folders, and excludes the output folder.
 - Shows an upright thumbnail grid with per-photo status.
-- Exports the camera's full-resolution embedded JPEG without resizing or
-  re-encoding it.
-- Corrects orientation with a lossless JPEG DCT transform when possible.
+- Extracts the camera's full-resolution embedded JPEG from RAW files. For
+  JPEG inputs, copies the original JPEG data.
+- Optimizes JPEG Huffman coding without changing image data, and corrects
+  orientation with a lossless JPEG DCT transform when possible.
+- Optionally limits each full-resolution JPEG to a user-selected size from
+  0.5 MB to 20 MB. A slider and numeric input set the target; this mode is
+  lossy and writes to a size-labeled subfolder.
 - Keeps location data out by default; preserving it is an explicit opt-in.
 - Writes collision-safe filenames such as `IMG_3128 (2).jpg`; existing files
   are never overwritten.
 - Saves a resumable journal, validates completed outputs by SHA-256, and
   supports pause, resume, cancel, and retry.
+- Clears completed photos from the batch list or clears the whole batch after
+  confirmation. These actions never delete source photos or exported JPEGs.
 - Runs entirely on the machine. No accounts, uploads, telemetry, or cloud
   processing.
 
 ## Quality guarantee
 
-RawDrop extracts the JPEG that the camera already embedded in the RAW file.
-It does not render the RAW sensor data, resize the image, or encode the JPEG a
-second time. This is what **no additional compression loss** means here.
+By default, RawDrop extracts the JPEG that the camera embedded in a RAW file,
+or copies the JPEG image data from a JPEG input. It does not render RAW sensor
+data or resize images. Lossless Huffman optimization can reduce file size
+without changing image coefficients.
 
 **JPEG is not lossless.** The camera has already compressed the image. RawDrop
 avoids adding another generation of JPEG compression, but it cannot recover
@@ -42,11 +49,11 @@ detail that the camera discarded.
 Image pixels are changed only when orientation requires a physical rotation.
 That uses `jpegtran`'s lossless DCT transform. When that transform cannot be
 applied safely, RawDrop does not crop or re-encode; it keeps the orientation
-metadata instead and says so.
+metadata instead and says so. The optional size-limit mode re-encodes JPEGs at
+a lower quality, retains the original resolution, and can reduce image detail.
 
-**The original RAW file is never modified, renamed, moved, or deleted.**
-RawDrop opens sources read-only. The acceptance test compares SHA-256 hashes
-of every original before and after export.
+**Original files are never modified, renamed, moved, or deleted.** RawDrop
+opens sources read-only.
 
 RawDrop never silently substitutes a small preview. It compares the embedded
 JPEG's dimensions with the camera's full image dimensions and requires at
@@ -64,6 +71,8 @@ embedded JPEG exists, the photo is skipped with a reason.
   app flags it as missing at launch; exports can still run with a warning and
   metadata-only orientation, but rotated photos will not be physically
   corrected.
+- `cjpeg` and `djpeg` from `libjpeg-turbo-progs`, needed only when the
+  optional under-5-MB setting is enabled.
 - A destination on a local filesystem that supports hard links, such as
   ext4, btrfs, XFS, or tmpfs. The final no-replace commit uses a hard link.
   FAT/exFAT and some network shares do not support this and fail safely.
@@ -127,11 +136,15 @@ checks. It uses the same `internal/raw` core as the app:
 ```sh
 GOTOOLCHAIN=go1.27.1 go run ./cmd/rawdrop-cli \
   -o /tmp/rawdrop-out \
-  "/path/to/RAW photos"
+  "/path/to/photos"
 
 # Keep GPS, or write orientation metadata without physical rotation:
 GOTOOLCHAIN=go1.27.1 go run ./cmd/rawdrop-cli \
   --keep-gps --no-rotate -o /tmp/rawdrop-out photo.CR2
+
+# Lossy size-limited JPEGs go into /tmp/rawdrop-out/Under 5 MB.
+GOTOOLCHAIN=go1.27.1 go run ./cmd/rawdrop-cli \
+  --under-5mb -o /tmp/rawdrop-out photo.JPG
 ```
 
 The CLI still refuses to overwrite an existing output and never modifies
@@ -150,7 +163,7 @@ its workspace is deleted and recreated on each run.
 
 ## How to use
 
-1. Drop RAW files or a folder onto the window, or use **Choose photos** /
+1. Drop RAW or JPEG files (or a folder) onto the window, or use **Choose photos** /
    **Choose folder**.
 2. Check the photo grid and the skipped/failed counts.
 3. Choose an output folder. With one source folder the suggested destination
@@ -158,7 +171,10 @@ its workspace is deleted and recreated on each run.
    RawDrop falls back to `~/Pictures/RawDrop Exports` (or a shared parent
    folder when one exists).
 4. Leave **Correct orientation** on unless you have a reason not to. Leave
-   **Keep location data** off unless you need GPS tags.
+   **Keep location data** off unless you need GPS tags. Enable **Limit JPEG
+   file size**, then choose a maximum from 0.5 MB to 20 MB with the slider or
+   numeric input. This creates lossy, full-resolution copies in a target-size
+   subfolder.
 5. Select **Export**. Use **Pause**, **Resume**, and **Cancel** as needed.
 6. When finished, use **Open folder** or double-click a tile to open an
    exported photo.
@@ -178,7 +194,8 @@ exiftool -ver
 ```
 
 RawDrop also honors `RAWDROP_EXIFTOOL=/path/to/exiftool` for a non-standard
-install. Without ExifTool, RawDrop cannot inspect or extract RAW files.
+install. Without ExifTool, RawDrop cannot inspect RAW files or preserve JPEG
+metadata.
 
 ### `jpegtran` is missing
 
@@ -189,10 +206,16 @@ sudo apt install libjpeg-turbo-progs
 jpegtran -version
 ```
 
-Without `jpegtran`, RawDrop cannot perform the lossless physical rotation.
-It will not crop or re-encode to fake it. The app shows a missing-tool banner
-at startup, and an affected export finishes with a warning while keeping the
-EXIF orientation tag. In that case, rely on an orientation-aware viewer.
+Without `jpegtran`, RawDrop cannot perform lossless size optimization or
+physical rotation. It will not crop or re-encode to fake it. An affected
+export keeps the EXIF orientation tag and reports a warning.
+
+### The JPEG size limit is unavailable
+
+Install `libjpeg-turbo-progs` to provide `cjpeg` and `djpeg`. This mode
+re-encodes the main JPEG image at a lower quality when needed; it keeps the
+pixel dimensions and writes results to a child folder named for the selected
+target size. The desktop app supports targets from 0.5 MB to 20 MB.
 
 ### A photo is skipped because it has no full-resolution embedded JPEG
 
@@ -234,7 +257,9 @@ the safest choice.
 That is the resumable journal. Choose **Export** to continue. Completed
 outputs are validated by size and SHA-256; missing or modified outputs are
 queued again. **New batch** clears the journal but never deletes exported
-files or originals.
+files or originals. Use **Clear exported** to remove only successful entries
+from the current list, or **Clear list** to reset the whole batch after
+confirmation. Both actions keep files on disk.
 
 Only one RawDrop instance owns the journal at a time. Close the other
 instance before resuming.
@@ -296,8 +321,8 @@ UI framework, which keeps the core testable without a window.
 - **Camera coverage:** Canon `.CR2` is the validated path. Other RAW formats
   are recognized but not broadly tested; export still requires a
   full-resolution embedded JPEG.
-- **Output format:** JPEG only. There is no RAW rendering, resizing, JPEG
-  re-encoding, or PNG/TIFF/WebP output.
+- **Output format:** JPEG only. There is no RAW rendering, resizing, or
+  PNG/TIFF/WebP output. Under-5-MB output is lossy JPEG recompression.
 - **Orientation:** physical correction depends on `jpegtran` and on the JPEG's
   block dimensions allowing a crop-free `-perfect` transform. Otherwise the
   orientation tag is retained and no crop is applied.
